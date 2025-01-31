@@ -29,18 +29,24 @@ const HTMLStripper = struct {
         HTMLUnmatchedTag,
     };
     const Error = Allocator.Error || HTMLError;
+    const VoidTags = std.StaticStringMap(void).initComptime(.{
+        .{"area"},  .{"base"}, .{"br"},    .{"col"},    .{"command"},
+        .{"embed"}, .{"hr"},   .{"img"},   .{"input"},  .{"keygen"},
+        .{"link"},  .{"meta"}, .{"param"}, .{"source"}, .{"track"},
+        .{"wbr"},   .{"!--"},
+    });
     const IgnoreTags = std.StaticStringMap(void).initComptime(.{
-        .{"head"},   .{"meta"},   .{"title"},    .{"base"},     .{"link"},
-        .{"style"},  .{"script"}, .{"noscript"}, .{"template"}, .{"slot"},
-        .{"iframe"}, .{"area"},   .{"track"},    .{"colgroup"}, .{"br"},
-        .{"hr"},     .{"img"},    .{"wbr"},
+        .{"script"}, .{"style"},
+    });
+    const AngleBracketTags = std.StaticStringMap(void).initComptime(.{
+        .{"title"}, .{"textarea"}, .{"script"}, .{"style"},
     });
 
     allocator: Allocator,
     links: ArrayList([]u8),
 
     _stack: ArrayList([]u8),
-    _state: *const fn (*Self, u8, *CharList) Error!bool = _content,
+    _state: *const fn (*Self, []const u8, *CharList) Error!usize = _beg,
     _tag_buffer: CharList,
     _attr_key_buffer: CharList,
     _attr_val_buffer: CharList,
@@ -90,16 +96,17 @@ const HTMLStripper = struct {
         self._attr_val_buffer.clearAndFree();
 
         var stripped = CharList.init(self.allocator);
+        errdefer stripped.deinit();
         var i: usize = 0;
         while (i < html.len) {
-            if (self._state(self, html[i], &stripped)) |skip| {
-                if (skip) i += 1;
+            if (self._state(self, html[i..], &stripped)) |skip| {
+                i += skip;
             } else |err| {
                 std.debug.print(
                     "Error {} at {s} with '{c}'\n",
                     .{
                         err,
-                        html[@max(0, i - 40)..@min(i + 41, html.len - 1)],
+                        html[@max(0, i - 100)..@min(i + 101, html.len - 1)],
                         html[i],
                     },
                 );
@@ -116,113 +123,165 @@ const HTMLStripper = struct {
         return try stripped.toOwnedSlice();
     }
 
-    fn _content(self: *Self, c: u8, content: *CharList) Error!bool {
-        if (c == '<') {
-            self._state = _tag;
-        } else if (self._stack.getLastOrNull()) |tag| {
-            if (!IgnoreTags.has(tag)) try appendChar(content, c);
-        }
-
-        return true;
+    fn _beg(self: *Self, html: []const u8, content: *CharList) Error!usize {
+        _ = content;
+        const c = html[0];
+        if (c == '<') self._state = _tag;
+        return 1;
     }
 
-    fn _tag(self: *Self, c: u8, content: *CharList) Error!bool {
+    fn _content(self: *Self, html: []const u8, content: *CharList) Error!usize {
+        const c = html[0];
+        const tag = self._stack.getLastOrNull().?;
+        if (c == '<') {
+            if (!AngleBracketTags.has(tag)) {
+                self._state = _tag;
+                return 1;
+            }
+
+            const tag_end_size = tag.len + 2;
+            if (html.len < tag_end_size) return error.HTMLParseError;
+            if (html[1] == '/' and
+                std.mem.eql(u8, tag, html[2..tag_end_size]))
+            {
+                try self._tag_buffer.appendSlice(tag);
+                self._state = _tagEndFound;
+                return tag_end_size;
+            }
+        }
+
+        if (!IgnoreTags.has(tag)) {
+            try appendChar(content, c);
+        }
+
+        return 1;
+    }
+
+    fn _tag(self: *Self, html: []const u8, content: *CharList) Error!usize {
         _ = content;
+        const c = html[0];
         if (isASCIIWhite(c)) return error.HTMLWhitespaceBeforeTag;
 
         if (c == '/') {
             self._state = _tagEnd;
-            return true;
+            return 1;
         }
 
         self._state = _tagStart;
-        return false;
+        return 0;
     }
 
-    fn _tagStart(self: *Self, c: u8, content: *CharList) Error!bool {
+    fn _tagStart(
+        self: *Self,
+        html: []const u8,
+        content: *CharList,
+    ) Error!usize {
         _ = content;
-        if (isASCIIWhite(c) or c == '>') {
+        const c = html[0];
+        if (isASCIIWhite(c) or c == '>' or c == '/') {
             const tag = try self._tag_buffer.toOwnedSlice();
+            std.debug.print("pushing {s}\n", .{tag});
             try self._stack.append(tag);
             self._state = _tagStartFound;
-            return c != '>';
+            return if (isASCIIWhite(c)) 1 else 0;
         }
 
         try self._tag_buffer.append(c);
-        return true;
+        return 1;
     }
 
-    fn _tagStartFound(self: *Self, c: u8, content: *CharList) Error!bool {
+    fn _tagStartFound(
+        self: *Self,
+        html: []const u8,
+        content: *CharList,
+    ) Error!usize {
         _ = content;
-        if (isASCIIWhite(c)) return true;
+        const c = html[0];
+        if (isASCIIWhite(c)) return 1;
         if (c == '/') {
             self._state = _tagEndFound;
-            return true;
+            return 1;
         }
 
         if (c == '>') {
-            self._state = _content;
-            return true;
-        }
-
-        self._state = _attrKey;
-        return false;
-    }
-
-    fn _tagEnd(self: *Self, c: u8, content: *CharList) Error!bool {
-        _ = content;
-        if (isASCIIWhite(c) or c == '>') {
-            self._state = _tagEndFound;
-            return c != '>';
-        }
-
-        try self._tag_buffer.append(c);
-        return true;
-    }
-
-    fn _tagEndFound(self: *Self, c: u8, content: *CharList) Error!bool {
-        if (isASCIIWhite(c)) return true;
-        if (c == '>') {
-            defer self._tag_buffer.clearAndFree();
-            // NOTE: If tag buffer is empty then we have html like:
-            // <link ... /> that ends with '/'. We don't need to
-            // search for it in the stack. Instead we can just pop the
-            // stack and remove it.
-            if (self._tag_buffer.items.len > 0) {
-                while (self._stack.popOrNull()) |tag| {
-                    defer self.allocator.free(tag);
-                    if (std.mem.eql(u8, tag, self._tag_buffer.items)) break;
-                } else {
-                    std.debug.print("Unmatched tag: '{s}'\n", .{self._tag_buffer.items});
-                    return error.HTMLUnmatchedTag;
-                }
-            } else {
-                self.allocator.free(self._stack.pop());
+            if (VoidTags.has(self._stack.getLast())) {
+                self._state = _tagEndFound;
+                return 0;
             }
 
             self._state = _content;
-            try appendChar(content, ' ');
-            return true;
+            return 1;
+        }
+
+        self._state = _attrKey;
+        return 0;
+    }
+
+    fn _tagEnd(self: *Self, html: []const u8, content: *CharList) Error!usize {
+        _ = content;
+        const c = html[0];
+        if (isASCIIWhite(c) or c == '>') {
+            self._state = _tagEndFound;
+            return if (c == '>') 0 else 1;
+        }
+
+        try self._tag_buffer.append(c);
+        return 1;
+    }
+
+    fn _tagEndFound(
+        self: *Self,
+        html: []const u8,
+        content: *CharList,
+    ) Error!usize {
+        const c = html[0];
+        if (isASCIIWhite(c)) return 1;
+        if (c == '>') {
+            defer self._tag_buffer.clearAndFree();
+            if (self._stack.popOrNull()) |tag| {
+                std.debug.print("popped {s}\n", .{tag});
+                defer self.allocator.free(tag);
+                if (self._tag_buffer.items.len > 0 and
+                    !std.mem.eql(u8, tag, self._tag_buffer.items))
+                {
+                    std.debug.print(
+                        "tag : '{s}', stack: '{s}'\n",
+                        .{ self._tag_buffer.items, tag },
+                    );
+                    return error.HTMLUnmatchedTag;
+                }
+
+                self._state = _content;
+                try appendChar(content, ' ');
+                return 1;
+            }
+
+            std.debug.print(
+                "Unmatched tag: '{s}'\n",
+                .{self._tag_buffer.items},
+            );
+            return error.HTMLUnmatchedTag;
         }
 
         return error.HTMLParseError;
     }
 
-    fn _attrKey(self: *Self, c: u8, content: *CharList) Error!bool {
+    fn _attrKey(self: *Self, html: []const u8, content: *CharList) Error!usize {
         _ = content;
+        const c = html[0];
         if (c == '=') {
             self._state = _attrVal;
-            return true;
+            return 1;
         }
 
         if (c == '>') {
             self._attr_key_buffer.clearAndFree();
-            self._state = _content;
-            return true;
+            self._state = _tagStartFound;
+            return 0;
         }
 
         if (!isASCIIWhite(c)) try self._attr_key_buffer.append(c);
-        return true;
+        return 1;
     }
 
     fn _helperAttrValEnd(self: *Self) !void {
@@ -239,8 +298,9 @@ const HTMLStripper = struct {
         self._attr_val_buffer.clearAndFree();
     }
 
-    fn _attrVal(self: *Self, c: u8, content: *CharList) Error!bool {
+    fn _attrVal(self: *Self, html: []const u8, content: *CharList) Error!usize {
         _ = content;
+        const c = html[0];
         if (self._attr_val_quote) |qc| {
             if (c == qc) {
                 try self._helperAttrValEnd();
@@ -253,24 +313,20 @@ const HTMLStripper = struct {
             if (isASCIIWhite(c)) {
                 if (self._attr_val_buffer.items.len > 0) {
                     try self._helperAttrValEnd();
-                    self._state = _attrKey;
+                    self._state = _tagStartFound;
                 }
             } else if (c == '"' or c == '\'') {
-                if (self._attr_val_buffer.items.len > 0) {
-                    return error.HTMLAttrValQuoteErr;
-                }
-
                 self._attr_val_quote = c;
             } else if (c == '>') {
                 try self._helperAttrValEnd();
                 self._state = _tagStartFound;
-                return false;
+                return 0;
             } else {
                 try self._attr_val_buffer.append(c);
             }
         }
 
-        return true;
+        return 1;
     }
 };
 

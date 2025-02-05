@@ -178,9 +178,16 @@ const HTMLStripper = struct {
     ) Error!usize {
         _ = content;
         const c = html[0];
+        // Handle comments below
+        if (html.len > 2 and std.mem.eql(u8, html[0..3], "!--")) {
+            self._tag_buffer.clearAndFree();
+            self._state = _comment;
+            return 3;
+        }
+
         if (isASCIIWhite(c) or c == '>' or c == '/') {
             const tag = try self._tag_buffer.toOwnedSlice();
-            std.debug.print("pushing {s}\n", .{tag});
+            // std.debug.print("pushing {s}\n", .{tag});
             try self._stack.append(tag);
             self._state = _tagStartFound;
             return if (isASCIIWhite(c)) 1 else 0;
@@ -239,7 +246,7 @@ const HTMLStripper = struct {
         if (c == '>') {
             defer self._tag_buffer.clearAndFree();
             if (self._stack.popOrNull()) |tag| {
-                std.debug.print("popped {s}\n", .{tag});
+                // std.debug.print("popped {s}\n", .{tag});
                 defer self.allocator.free(tag);
                 if (self._tag_buffer.items.len > 0 and
                     !std.mem.eql(u8, tag, self._tag_buffer.items))
@@ -324,6 +331,19 @@ const HTMLStripper = struct {
             } else {
                 try self._attr_val_buffer.append(c);
             }
+        }
+
+        return 1;
+    }
+
+    fn _comment(self: *Self, html: []const u8, content: *CharList) Error!usize {
+        _ = content;
+
+        // Immediately exit when '--' is seen. Process 3 chars because
+        // '--' cannot occur without the final '>'.
+        if (html.len > 1 and std.mem.eql(u8, html[0..2], "--")) {
+            self._state = _content;
+            return 3;
         }
 
         return 1;

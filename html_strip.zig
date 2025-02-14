@@ -1,25 +1,11 @@
 const std = @import("std");
-
 const character_entity = @import("character_entity.zig");
+
+const isASCIIWhite = character_entity.isASCIIWhite;
+const EntityAutoTranslator = character_entity.AutoTranslator;
 const ArrayList = std.ArrayList;
 const CharList = std.ArrayList(u8);
 const Allocator = std.mem.Allocator;
-
-fn isASCIIWhite(c: u8) bool {
-    return c == ' ' or (c >= '\t' and c <= '\r');
-}
-
-/// Append char to list effectively ignoring excess white-space.
-fn appendChar(list: *CharList, c: u8) !void {
-    if (!isASCIIWhite(c)) {
-        try list.append(c);
-        return;
-    }
-
-    if (list.getLastOrNull()) |last_c| {
-        if (!isASCIIWhite(last_c)) try list.append(c);
-    }
-}
 
 pub const HTMLStripper = struct {
     const Self = @This();
@@ -48,12 +34,10 @@ pub const HTMLStripper = struct {
     links: ArrayList([]u8),
 
     _stack: ArrayList([]u8),
-    _state: *const fn (*Self, []const u8, *CharList) Error!usize = _beg,
+    _state: *const fn (*Self, []const u8, *EntityAutoTranslator) Error!usize = _beg,
     _tag_buffer: CharList,
     _attr_key_buffer: CharList,
-    _attr_val_buffer: CharList,
-    _entity_buffer: CharList,
-    _in_entity: bool = false,
+    _attr_val_buffer: EntityAutoTranslator,
     _attr_val_quote: ?u8 = null,
 
     pub fn init(allocator: Allocator) Self {
@@ -63,8 +47,10 @@ pub const HTMLStripper = struct {
             .links = ArrayList([]u8).init(allocator),
             ._tag_buffer = CharList.init(allocator),
             ._attr_key_buffer = CharList.init(allocator),
-            ._attr_val_buffer = CharList.init(allocator),
-            ._entity_buffer = CharList.init(allocator),
+            ._attr_val_buffer = EntityAutoTranslator.init(
+                allocator,
+                false,
+            ),
         };
     }
 
@@ -82,10 +68,9 @@ pub const HTMLStripper = struct {
         self._tag_buffer.deinit();
         self._attr_key_buffer.deinit();
         self._attr_val_buffer.deinit();
-        self._entity_buffer.deinit();
     }
 
-    pub fn clear(self: *Self) void {
+    pub fn clearAndFree(self: *Self) void {
         for (self._stack.items) |item| {
             self.allocator.free(item);
         }
@@ -98,15 +83,14 @@ pub const HTMLStripper = struct {
         self._tag_buffer.clearAndFree();
         self._attr_key_buffer.clearAndFree();
         self._attr_val_buffer.clearAndFree();
-        self._entity_buffer.clearAndFree();
     }
 
     /// Strip given html. Returned slice is owned by the caller.
     pub fn strip(self: *Self, html: []const u8) ![]const u8 {
         // Clear stack and links.
-        self.clear();
+        self.clearAndFree();
 
-        var stripped = CharList.init(self.allocator);
+        var stripped = EntityAutoTranslator.init(self.allocator, true);
         errdefer stripped.deinit();
         var i: usize = 0;
         while (i < html.len) {
@@ -125,23 +109,33 @@ pub const HTMLStripper = struct {
             }
         }
 
-        if (stripped.getLastOrNull()) |last_c| {
+        if (stripped.translated.getLastOrNull()) |last_c| {
             if (isASCIIWhite(last_c)) {
-                stripped.shrinkAndFree(stripped.items.len - 1);
+                stripped.translated.shrinkAndFree(
+                    stripped.translated.items.len - 1,
+                );
             }
         }
 
         return try stripped.toOwnedSlice();
     }
 
-    fn _beg(self: *Self, html: []const u8, content: *CharList) Error!usize {
+    fn _beg(
+        self: *Self,
+        html: []const u8,
+        content: *EntityAutoTranslator,
+    ) Error!usize {
         _ = content;
         const c = html[0];
         if (c == '<') self._state = _tag;
         return 1;
     }
 
-    fn _content(self: *Self, html: []const u8, content: *CharList) Error!usize {
+    fn _content(
+        self: *Self,
+        html: []const u8,
+        content: *EntityAutoTranslator,
+    ) Error!usize {
         const c = html[0];
         const tag = self._stack.getLastOrNull().?;
         if (c == '<') {
@@ -164,33 +158,15 @@ pub const HTMLStripper = struct {
         if (IgnoreTags.has(tag))
             return 1;
 
-        if (!self._in_entity and c == '&') {
-            self._in_entity = true;
-            return 1;
-        }
-
-        if (self._in_entity and c == ';') {
-            defer self._entity_buffer.clearAndFree();
-            self._in_entity = false;
-            const trans = try character_entity.translate_entity(
-                self._entity_buffer.items,
-                self.allocator,
-            );
-            defer self.allocator.free(trans);
-            try content.appendSlice(trans);
-            return 1;
-        }
-
-        if (self._in_entity) {
-            try self._entity_buffer.append(c);
-            return 1;
-        }
-
-        try appendChar(content, c);
+        try content.append(c);
         return 1;
     }
 
-    fn _tag(self: *Self, html: []const u8, content: *CharList) Error!usize {
+    fn _tag(
+        self: *Self,
+        html: []const u8,
+        content: *EntityAutoTranslator,
+    ) Error!usize {
         _ = content;
         const c = html[0];
         if (isASCIIWhite(c)) return error.HTMLWhitespaceBeforeTag;
@@ -207,7 +183,7 @@ pub const HTMLStripper = struct {
     fn _tagStart(
         self: *Self,
         html: []const u8,
-        content: *CharList,
+        content: *EntityAutoTranslator,
     ) Error!usize {
         _ = content;
         const c = html[0];
@@ -233,7 +209,7 @@ pub const HTMLStripper = struct {
     fn _tagStartFound(
         self: *Self,
         html: []const u8,
-        content: *CharList,
+        content: *EntityAutoTranslator,
     ) Error!usize {
         _ = content;
         const c = html[0];
@@ -257,7 +233,11 @@ pub const HTMLStripper = struct {
         return 0;
     }
 
-    fn _tagEnd(self: *Self, html: []const u8, content: *CharList) Error!usize {
+    fn _tagEnd(
+        self: *Self,
+        html: []const u8,
+        content: *EntityAutoTranslator,
+    ) Error!usize {
         _ = content;
         const c = html[0];
         if (isASCIIWhite(c) or c == '>') {
@@ -272,7 +252,7 @@ pub const HTMLStripper = struct {
     fn _tagEndFound(
         self: *Self,
         html: []const u8,
-        content: *CharList,
+        content: *EntityAutoTranslator,
     ) Error!usize {
         const c = html[0];
         if (isASCIIWhite(c)) return 1;
@@ -292,7 +272,7 @@ pub const HTMLStripper = struct {
                 }
 
                 self._state = _content;
-                try appendChar(content, ' ');
+                try content.append(' ');
                 return 1;
             }
 
@@ -306,7 +286,11 @@ pub const HTMLStripper = struct {
         return error.HTMLParseError;
     }
 
-    fn _attrKey(self: *Self, html: []const u8, content: *CharList) Error!usize {
+    fn _attrKey(
+        self: *Self,
+        html: []const u8,
+        content: *EntityAutoTranslator,
+    ) Error!usize {
         _ = content;
         const c = html[0];
         if (c == '=') {
@@ -325,6 +309,9 @@ pub const HTMLStripper = struct {
     }
 
     fn _helperAttrValEnd(self: *Self) !void {
+        defer self._attr_val_buffer.clearAndFree();
+        defer self._attr_key_buffer.clearAndFree();
+
         if (self._stack.items.len == 0) return error.HTMLAttrWithoutTag;
 
         // Only discover links and clear key and val buffers afterwards.
@@ -333,12 +320,13 @@ pub const HTMLStripper = struct {
         {
             try self.links.append(try self._attr_val_buffer.toOwnedSlice());
         }
-
-        self._attr_key_buffer.clearAndFree();
-        self._attr_val_buffer.clearAndFree();
     }
 
-    fn _attrVal(self: *Self, html: []const u8, content: *CharList) Error!usize {
+    fn _attrVal(
+        self: *Self,
+        html: []const u8,
+        content: *EntityAutoTranslator,
+    ) Error!usize {
         _ = content;
         const c = html[0];
         if (self._attr_val_quote) |qc| {
@@ -351,7 +339,7 @@ pub const HTMLStripper = struct {
             }
         } else {
             if (isASCIIWhite(c)) {
-                if (self._attr_val_buffer.items.len > 0) {
+                if (self._attr_val_buffer.translated.items.len > 0) {
                     try self._helperAttrValEnd();
                     self._state = _tagStartFound;
                 }
@@ -369,7 +357,11 @@ pub const HTMLStripper = struct {
         return 1;
     }
 
-    fn _comment(self: *Self, html: []const u8, content: *CharList) Error!usize {
+    fn _comment(
+        self: *Self,
+        html: []const u8,
+        content: *EntityAutoTranslator,
+    ) Error!usize {
         _ = content;
 
         // Immediately exit when '--' is seen. Process 3 chars because
@@ -425,4 +417,14 @@ test "stripHtml" {
         ,
     );
     defer s4.deinit();
+
+    // Link with entity.
+    var s5 = try expectHtmlStrip(
+        "Title Paragraph with link .",
+        \\<div><h1>Title</h1><p>Paragraph with <a href="http://wiki&amp;">
+        \\link</a>.</p></div>
+        ,
+    );
+    defer s5.deinit();
+    try std.testing.expectEqualSlices(u8, "http://wiki&", s5.links.items[0]);
 }

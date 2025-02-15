@@ -249,6 +249,26 @@ pub const HTMLStripper = struct {
         return 1;
     }
 
+    fn unmatchedTag(self: *Self) void {
+        var found_idx = self._stack.items.len;
+        while (found_idx > 0) : (found_idx -= 1) {
+            if (std.mem.eql(
+                u8,
+                self._tag_buffer.items,
+                self._stack.items[found_idx - 1],
+            )) {
+                self.allocator.free(self._stack.orderedRemove(found_idx - 1));
+                std.debug.print(
+                    "Found matching tag at: {}\n",
+                    .{found_idx - 1},
+                );
+                break;
+            }
+        }
+
+        std.debug.print("Stray tag.\n", .{});
+    }
+
     fn _tagEndFound(
         self: *Self,
         html: []const u8,
@@ -258,17 +278,17 @@ pub const HTMLStripper = struct {
         if (isASCIIWhite(c)) return 1;
         if (c == '>') {
             defer self._tag_buffer.clearAndFree();
-            if (self._stack.popOrNull()) |tag| {
-                // std.debug.print("popped {s}\n", .{tag});
-                defer self.allocator.free(tag);
+            if (self._stack.getLastOrNull()) |tag| {
                 if (self._tag_buffer.items.len > 0 and
                     !std.mem.eql(u8, tag, self._tag_buffer.items))
                 {
                     std.debug.print(
-                        "tag : '{s}', stack: '{s}'\n",
-                        .{ self._tag_buffer.items, tag },
+                        "Unmatched tag: '{s}'\n",
+                        .{self._tag_buffer.items},
                     );
-                    return error.HTMLUnmatchedTag;
+                    self.unmatchedTag();
+                } else {
+                    self.allocator.free(self._stack.pop());
                 }
 
                 self._state = _content;

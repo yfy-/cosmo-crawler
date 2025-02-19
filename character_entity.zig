@@ -2272,6 +2272,7 @@ pub const AutoTranslator = struct {
     pub fn clearAndFree(self: *Self) void {
         self.translated.clearAndFree();
         self._entity_buffer.clearAndFree();
+        self._in_entity = false;
     }
 
     /// Collect the translated buffer. Slice is owned by the client.
@@ -2314,3 +2315,59 @@ pub const AutoTranslator = struct {
         }
     }
 };
+
+test "auto_translator_no_ignore" {
+    var t = AutoTranslator.init(talloc, false);
+    defer t.deinit();
+    for ("abc &amp;  def\t &lt;&gt;  ") |c| {
+        try t.append(c);
+    }
+    try std.testing.expectEqualStrings("abc &  def\t <>  ", t.translated.items);
+}
+
+test "auto_translator_ignore" {
+    var t = AutoTranslator.init(talloc, true);
+    defer t.deinit();
+    for ("abc &amp;  def\t &lt;&gt;  ") |c| {
+        try t.append(c);
+    }
+    try std.testing.expectEqualStrings("abc & def\t<> ", t.translated.items);
+}
+
+test "auto_translator_reuse" {
+    var t = AutoTranslator.init(talloc, false);
+    defer t.deinit();
+    for ("abc &amp; ") |c| {
+        try t.append(c);
+    }
+    try std.testing.expectEqualStrings("abc & ", t.translated.items);
+    t.clearAndFree();
+    for ("def &lt; &gt; ") |c| {
+        try t.append(c);
+    }
+    try std.testing.expectEqualStrings("def < > ", t.translated.items);
+}
+
+test "auto_translator_to_owned_slice" {
+    var t = AutoTranslator.init(talloc, false);
+    defer t.deinit();
+    {
+        for ("abc &amp; ") |c| {
+            try t.append(c);
+        }
+
+        const res = try t.toOwnedSlice();
+        defer talloc.free(res);
+        try std.testing.expectEqualStrings("abc & ", res);
+    }
+
+    {
+        for ("def &lt; &gt; ") |c| {
+            try t.append(c);
+        }
+
+        const res = try t.toOwnedSlice();
+        defer talloc.free(res);
+        try std.testing.expectEqualStrings("def < > ", res);
+    }
+}

@@ -17,24 +17,47 @@ pub const HTMLStripper = struct {
         HTMLUnmatchedTag,
     };
     const Error = Allocator.Error || HTMLError || character_entity.Error;
+
+    /// Tags that can end without the associated closing tag.
     const VoidTags = std.StaticStringMap(void).initComptime(.{
         .{"area"},  .{"base"}, .{"br"},    .{"col"},    .{"command"},
         .{"embed"}, .{"hr"},   .{"img"},   .{"input"},  .{"keygen"},
         .{"link"},  .{"meta"}, .{"param"}, .{"source"}, .{"track"},
         .{"wbr"},   .{"!--"},
     });
+
+    /// Tags that don't interests humans.
     const IgnoreTags = std.StaticStringMap(void).initComptime(.{
         .{"script"}, .{"style"},
     });
+
+    /// Tags that < and > can appear.
     const AngleBracketTags = std.StaticStringMap(void).initComptime(.{
         .{"title"}, .{"textarea"}, .{"script"}, .{"style"},
+    });
+
+    /// Tags that start a new line.
+    const BlockLevelTags = std.StaticStringMap(void).initComptime(.{
+        .{"address"}, .{"article"},  .{"aside"},      .{"blockquote"},
+        .{"canvas"},  .{"dd"},       .{"div"},        .{"dl"},
+        .{"dt"},      .{"fieldset"}, .{"figcaption"}, .{"figure"},
+        .{"footer"},  .{"form"},     .{"header"},     .{"hr"},
+        .{"li"},      .{"main"},     .{"nav"},        .{"noscript"},
+        .{"ol"},      .{"p"},        .{"pre"},        .{"section"},
+        .{"table"},   .{"tfoot"},    .{"ul"},         .{"vide"},
+        .{"h1"},      .{"h2"},       .{"h3"},         .{"h4"},
+        .{"h5"},      .{"h6"},       .{"br"},
     });
 
     allocator: Allocator,
     links: ArrayList([]u8),
 
     _stack: ArrayList([]u8),
-    _state: *const fn (*Self, []const u8, *EntityAutoTranslator) Error!usize = _beg,
+    _state: *const fn (
+        *Self,
+        []const u8,
+        *EntityAutoTranslator,
+    ) Error!usize = _beg,
     _tag_buffer: CharList,
     _attr_key_buffer: CharList,
     _attr_val_buffer: EntityAutoTranslator,
@@ -211,7 +234,11 @@ pub const HTMLStripper = struct {
         html: []const u8,
         content: *EntityAutoTranslator,
     ) Error!usize {
-        _ = content;
+        // Add new line for block level starts.
+        if (BlockLevelTags.has(self._stack.getLast())) {
+            try content.append('\n');
+        }
+
         const c = html[0];
         if (isASCIIWhite(c)) return 1;
         if (c == '/') {
@@ -262,7 +289,7 @@ pub const HTMLStripper = struct {
                     "Found matching tag at: {}\n",
                     .{found_idx - 1},
                 );
-                break;
+                return;
             }
         }
 
@@ -274,6 +301,7 @@ pub const HTMLStripper = struct {
         html: []const u8,
         content: *EntityAutoTranslator,
     ) Error!usize {
+        _ = content;
         const c = html[0];
         if (isASCIIWhite(c)) return 1;
         if (c == '>') {
@@ -292,7 +320,6 @@ pub const HTMLStripper = struct {
                 }
 
                 self._state = _content;
-                try content.append(' ');
                 return 1;
             }
 
@@ -398,37 +425,40 @@ pub const HTMLStripper = struct {
 /// Check if stripped html_text is equal to expected.
 fn expectHtmlStrip(expected: []const u8, html_text: []const u8) !HTMLStripper {
     var stripper = HTMLStripper.init(std.testing.allocator);
+    errdefer stripper.deinit();
     const actual = try stripper.strip(html_text);
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualStrings(expected, actual);
     return stripper;
 }
 
-test "stripHtml" {
-    // Very simple.
-    var s1 = try expectHtmlStrip("erman", "<p> erman </p>");
-    defer s1.deinit();
+test "strip_html_very_simple" {
+    var s = try expectHtmlStrip("erman", "<p> erman </p>");
+    s.deinit();
+}
 
-    // Nested simple.
-    var s2 = try expectHtmlStrip(
+test "strip_html_nested_simple" {
+    var s = try expectHtmlStrip(
         "This is a simple example.",
         "<p>This is a <strong>simple</strong> example.</p>",
     );
-    defer s2.deinit();
+    s.deinit();
+}
 
-    // Nested link.
-    var s3 = try expectHtmlStrip(
-        "Title Paragraph with link .",
+test "strip_html_nested_link" {
+    var s = try expectHtmlStrip(
+        "Title\nParagraph with link.",
         \\<div><h1>Title</h1><p>Paragraph with <a href="http://wiki">link</a>.
         \\</p></div>
         ,
     );
-    defer s3.deinit();
-    try std.testing.expectEqualSlices(u8, "http://wiki", s3.links.items[0]);
+    defer s.deinit();
+    try std.testing.expectEqualSlices(u8, "http://wiki", s.links.items[0]);
+}
 
-    // Nested list.
-    var s4 = try expectHtmlStrip(
-        "Item 1 Item 2 with emphasis Item 3",
+test "strip_html_nested_list" {
+    var s = try expectHtmlStrip(
+        "Item 1\nItem 2 with emphasis\nItem 3",
         \\<ul>
         \\  <li>Item 1</li>
         \\  <li>Item 2 with <em>emphasis</em></li>
@@ -436,15 +466,85 @@ test "stripHtml" {
         \\</ul>
         ,
     );
-    defer s4.deinit();
+    defer s.deinit();
+}
 
-    // Link with entity.
-    var s5 = try expectHtmlStrip(
-        "Title Paragraph with link .",
+test "strip_html_link_with_entity" {
+    var s = try expectHtmlStrip(
+        "Title\nParagraph with link.",
         \\<div><h1>Title</h1><p>Paragraph with <a href="http://wiki&amp;">
         \\link</a>.</p></div>
         ,
     );
-    defer s5.deinit();
-    try std.testing.expectEqualSlices(u8, "http://wiki&", s5.links.items[0]);
+    defer s.deinit();
+    try std.testing.expectEqualSlices(u8, "http://wiki&", s.links.items[0]);
+}
+
+test "strip_html_void_tags" {
+    const html =
+        \\<!DOCTYPE html>
+        \\<html lang="en">
+        \\<head>
+        \\<meta charset="UTF-8">
+        \\<title>Simple HTML Example</title>
+        \\</head>
+        \\<body>
+        \\<div>
+        \\<h1>Welcome</h1>
+        \\<p>This paragraph contains an image:
+        \\<img src="example.jpg" alt="Example Image">
+        \\</p>
+        \\<div>
+        \\<p>
+        \\Here is a line break after this sentence:<br>
+        \\And here is the next line.
+        \\</p>
+        \\<hr>
+        \\<p>Enter your name:
+        \\<input type="text" placeholder="Name">
+        \\</p>
+        \\</div>
+        \\</div>
+        \\</body>
+        \\</html>
+    ;
+    const exp = "Simple HTML Example\nWelcome\nThis paragraph contains an " ++
+        "image:\nHere is a line break after this sentence:\nAnd here is the " ++
+        "next line.\nEnter your name:";
+    var s = try expectHtmlStrip(exp, html);
+    s.deinit();
+}
+
+test "strip_html_ignore_tags_comment" {
+    const html =
+        \\<!DOCTYPE html>
+        \\<html>
+        \\<head>
+        \\<meta charset="UTF-8">
+        \\<title>Short &lt; &gt;</title>
+        \\<style>
+        \\body { font-family: Arial; }
+        \\</style>
+        \\</head>
+        \\<body>
+        \\<!-- A simple comment -->
+        \\<!-- <p>This is a valid HTML snippet inside a comment.</p> -->
+        \\<h1>Hi! &#x00A8; </h1>
+        \\<script>
+        \\alert('Hello!');
+        \\</script>
+        \\</body>
+        \\</html>
+    ;
+    const exp = "Short < >\nHi! ¨";
+    var s = try expectHtmlStrip(exp, html);
+    s.deinit();
+}
+
+test "strip_html_weird_unmatching" {
+    var s = try expectHtmlStrip(
+        "12345",
+        "<p>1<b>2<i>3</b>4</i>5</p>",
+    );
+    s.deinit();
 }

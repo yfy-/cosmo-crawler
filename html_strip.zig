@@ -1,4 +1,5 @@
 const std = @import("std");
+const fs = std.fs;
 const character_entity = @import("character_entity.zig");
 
 const isASCIIWhite = character_entity.isASCIIWhite;
@@ -36,7 +37,9 @@ pub const HTMLStripper = struct {
         .{"title"}, .{"textarea"}, .{"script"}, .{"style"},
     });
 
-    /// Tags that start a new line.
+    /// Tags that start a new line. 'br' is actually inline but since
+    /// it specially inserts a new line to the rendered output we
+    /// store them here.
     const BlockLevelTags = std.StaticStringMap(void).initComptime(.{
         .{"address"}, .{"article"},  .{"aside"},      .{"blockquote"},
         .{"canvas"},  .{"dd"},       .{"div"},        .{"dl"},
@@ -120,8 +123,8 @@ pub const HTMLStripper = struct {
             if (self._state(self, html[i..], &stripped)) |skip| {
                 i += skip;
             } else |err| {
-                std.debug.print(
-                    "Error {} at {s} with '{c}'\n",
+                std.log.err(
+                    "Error {} at {s} with '{c}'",
                     .{
                         err,
                         html[@max(0, i - 100)..@min(i + 101, html.len - 1)],
@@ -181,7 +184,14 @@ pub const HTMLStripper = struct {
         if (IgnoreTags.has(tag))
             return 1;
 
-        try content.append(c);
+        // Swap new lines with ordinary spaces since new lines can
+        // only be inserted with BlockLevelTags.
+        if (c == '\n' or c == '\r') {
+            try content.append(' ');
+        } else {
+            try content.append(c);
+        }
+
         return 1;
     }
 
@@ -219,7 +229,6 @@ pub const HTMLStripper = struct {
 
         if (isASCIIWhite(c) or c == '>' or c == '/') {
             const tag = try self._tag_buffer.toOwnedSlice();
-            // std.debug.print("pushing {s}\n", .{tag});
             try self._stack.append(tag);
             self._state = _tagStartFound;
             return if (isASCIIWhite(c)) 1 else 0;
@@ -234,7 +243,6 @@ pub const HTMLStripper = struct {
         html: []const u8,
         content: *EntityAutoTranslator,
     ) Error!usize {
-        // Add new line for block level starts.
         if (BlockLevelTags.has(self._stack.getLast())) {
             try content.append('\n');
         }
@@ -285,15 +293,15 @@ pub const HTMLStripper = struct {
                 self._stack.items[found_idx - 1],
             )) {
                 self.allocator.free(self._stack.orderedRemove(found_idx - 1));
-                std.debug.print(
-                    "Found matching tag at: {}\n",
+                std.log.warn(
+                    "Found matching tag at: {}",
                     .{found_idx - 1},
                 );
                 return;
             }
         }
 
-        std.debug.print("Stray tag.\n", .{});
+        std.log.warn("Stray tag.", .{});
     }
 
     fn _tagEndFound(
@@ -310,8 +318,8 @@ pub const HTMLStripper = struct {
                 if (self._tag_buffer.items.len > 0 and
                     !std.mem.eql(u8, tag, self._tag_buffer.items))
                 {
-                    std.debug.print(
-                        "Unmatched tag: '{s}'\n",
+                    std.log.warn(
+                        "Unmatched tag: '{s}'",
                         .{self._tag_buffer.items},
                     );
                     self.unmatchedTag();
@@ -323,8 +331,8 @@ pub const HTMLStripper = struct {
                 return 1;
             }
 
-            std.debug.print(
-                "Unmatched tag: '{s}'\n",
+            std.log.err(
+                "Unmatched tag: '{s}'",
                 .{self._tag_buffer.items},
             );
             return error.HTMLUnmatchedTag;
@@ -422,12 +430,14 @@ pub const HTMLStripper = struct {
     }
 };
 
+const talloc = std.testing.allocator;
+
 /// Check if stripped html_text is equal to expected.
 fn expectHtmlStrip(expected: []const u8, html_text: []const u8) !HTMLStripper {
-    var stripper = HTMLStripper.init(std.testing.allocator);
+    var stripper = HTMLStripper.init(talloc);
     errdefer stripper.deinit();
     const actual = try stripper.strip(html_text);
-    defer std.testing.allocator.free(actual);
+    defer talloc.free(actual);
     try std.testing.expectEqualStrings(expected, actual);
     return stripper;
 }
@@ -547,4 +557,60 @@ test "strip_html_weird_unmatching" {
         "<p>1<b>2<i>3</b>4</i>5</p>",
     );
     s.deinit();
+}
+
+fn expectHtmlStripFile(comptime file_base: []const u8) !void {
+    const src_dir = fs.path.dirname(@src().file) orelse "";
+    const resource_dir = try fs.path.join(
+        talloc,
+        &[_][]const u8{ src_dir, "test-resource", "html-strip" },
+    );
+    defer talloc.free(resource_dir);
+
+    // Read html file
+    const html_path = try fs.path.join(
+        talloc,
+        &[_][]const u8{ resource_dir, file_base ++ ".html" },
+    );
+    defer talloc.free(html_path);
+
+    const html_file = try fs.cwd().openFile(html_path, .{});
+    defer html_file.close();
+
+    const html = try html_file.readToEndAlloc(
+        talloc,
+        5 * 1024 * 1024,
+    );
+    defer talloc.free(html);
+
+    // Read text file
+    const text_path = try fs.path.join(
+        talloc,
+        &[_][]const u8{ resource_dir, file_base ++ ".txt" },
+    );
+    defer talloc.free(text_path);
+
+    const text_file = try fs.cwd().openFile(text_path, .{});
+    defer text_file.close();
+
+    const text = try text_file.readToEndAlloc(
+        talloc,
+        5 * 1024 * 1024,
+    );
+    defer talloc.free(text);
+
+    var s = try expectHtmlStrip(text, html);
+    s.deinit();
+}
+
+test "integration_mygithub" {
+    try expectHtmlStripFile("mygithub");
+}
+
+test "integration_w3c" {
+    try expectHtmlStripFile("w3c");
+}
+
+test "integration_vertex_cover" {
+    try expectHtmlStripFile("vertex_cover");
 }

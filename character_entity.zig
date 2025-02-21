@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 
 pub const EncodingEntityMap = std.StaticStringMap([2]u21).initComptime(
@@ -2144,7 +2145,8 @@ pub fn translateEntity(
     allocator: Allocator,
 ) Error![]u8 {
     if (entity.len < 2) {
-        std.debug.print("Invalid character entity '{s}'.\n", .{entity});
+        if (!builtin.is_test)
+            std.log.err("Invalid character entity '{s}'.", .{entity});
         return error.InvalidCharacterEntity;
     }
 
@@ -2157,7 +2159,8 @@ pub fn translateEntity(
     } else if (EncodingEntityMap.get(entity)) |*ent_cps| {
         cps_write = ent_cps;
     } else {
-        std.debug.print("Invalid character entity '{s}'.\n", .{entity});
+        if (!builtin.is_test)
+            std.log.err("Invalid character entity '{s}'.", .{entity});
         return error.InvalidCharacterEntity;
     }
 
@@ -2311,7 +2314,14 @@ pub const AutoTranslator = struct {
         }
 
         if (self.translated.getLastOrNull()) |last_c| {
-            if (!isASCIIWhite(last_c)) try self.translated.append(c);
+            if (isASCIIWhite(last_c)) {
+                // Switch last whitespace to new line when we see a new line.
+                if (c == '\n') {
+                    self.translated.items[self.translated.items.len - 1] = c;
+                }
+            } else {
+                try self.translated.append(c);
+            }
         }
     }
 };
@@ -2370,4 +2380,13 @@ test "auto_translator_to_owned_slice" {
         defer talloc.free(res);
         try std.testing.expectEqualStrings("def < > ", res);
     }
+}
+
+test "auto_translator_new_line_overrides" {
+    var t = AutoTranslator.init(talloc, true);
+    defer t.deinit();
+    for ("abc \n &amp;") |c| {
+        try t.append(c);
+    }
+    try std.testing.expectEqualStrings("abc\n&", t.translated.items);
 }

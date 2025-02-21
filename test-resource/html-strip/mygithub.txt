@@ -1,0 +1,184 @@
+yfy-/cosmo-crawler: A web crawler in Zig.
+Skip to content
+Navigation Menu
+Global navigation
+Home
+Issues
+Pull requests
+Projects
+Discussions
+Codespaces
+Copilot
+Explore
+Marketplace
+Loading
+© 2025 GitHub, Inc.
+About Blog Terms Privacy Security Status
+yfy-  / cosmo-crawler
+Navigate back to
+yfy-
+cosmo-crawler
+yfy- /
+cosmo-crawler
+Type / to search
+Search code, repositories, users, issues, pull requests...
+Search
+Clear
+Search syntax tips
+Give feedback
+Provide feedback
+We read every piece of feedback, and take your input very seriously. Include my email address so I can be contacted
+Cancel Submit feedback
+Saved searches
+Use saved searches to filter your results more quickly
+Name
+Query
+To see all available qualifiers, see our documentation.
+Cancel Create saved search
+Chat with Copilot Open Copilot…
+Create new...
+Your issues Your pull requests Notifications
+Code
+Issues 0
+Pull requests 0
+Actions
+Projects 0
+Wiki
+Security
+Insights
+Settings
+Additional navigation options
+Code
+Issues
+Pull requests
+Actions
+Projects
+Wiki
+Security
+Insights
+Settings
+You signed in with another tab or window. Reload to refresh your session. You signed out in another tab or window. Reload to refresh your session. You switched accounts on another tab or window. Reload to refresh your session. Dismiss alert
+{{ message }}
+Create list
+Create a list to organize your starred repositories.
+Name .
+32 remaining
+Description .
+160 remaining
+. Create
+Tip: type : to add emoji to the name or description.
+cosmo-crawler Public
+Unpin
+Watch
+Couldn't load subscription status.  Retry
+Fork 0 Fork your own copy of yfy-/cosmo-crawler
+Forks could not be loaded Loading
+Unstar this repository?
+This will remove {{ repoNameWithOwner }} from the {{ listsWithCount }} that it's been added to.
+Unstar
+Starred 1
+Lists
+Loading
+Star 1
+Lists
+Loading
+Fork your own copy of yfy-/cosmo-crawler
+Unstar this repository
+Star this repository
+A web crawler in Zig.
+License
+GPL-3.0 license
+1 star 0 forks 1 watching Branches Tags Activity
+Public repository
+Open in github.dev Open in a new github.dev tab Open in codespace
+yfy-/cosmo-crawler
+ main
+BranchesTags
+Go to file
+Add file
+Add fileAdd fileCode
+Folders and files
+NameName
+Last commit message
+Last commit date
+Latest commit
+ 
+History8 Commits
+.gitignore
+.gitignore
+ 
+ 
+LICENSE.txt
+LICENSE.txt
+ 
+ 
+README.md
+README.md
+ 
+ 
+build.zig
+build.zig
+ 
+ 
+character_entity.zig
+character_entity.zig
+ 
+ 
+crawler.zig
+crawler.zig
+ 
+ 
+html_strip.zig
+html_strip.zig
+ 
+ 
+View all files
+Drop to upload your files
+Repository files navigation
+README
+GPL-3.0 license
+Cosmo Crawler
+Currently this is only an HTML stripping tool. It removes HTML tags and other boilerplate to extract human readable content. But plan is to make it a web crawler.
+Build
+# An optimized build zig build -Doptimize=ReleaseFast
+Usage
+# Stripped content will be in stdout zig-out/bin/crawler <your_file>.html
+Edit repository details
+Description
+Website
+Topics (separate with spaces)
+Include in the home page Releases Packages Deployments
+Save changes Cancel
+About
+A web crawler in Zig.
+Resources
+Readme
+License
+GPL-3.0 license
+Activity
+Stars
+1 star
+Watchers
+1 watching
+Forks
+0 forks
+Releases
+No releases published
+Create a new release
+Packages 0
+No packages published
+Publish your first package
+Languages
+Zig 100.0%
+Footer
+© 2025 GitHub, Inc.
+Footer navigation
+Terms
+Privacy
+Security
+Status
+Docs
+Contact
+Manage cookies
+Do not share my personal information
+You can’t perform that action at this time.

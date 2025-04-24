@@ -324,7 +324,8 @@ pub const HTMLStripper = struct {
                     );
                     self.unmatchedTag();
                 } else {
-                    self.allocator.free(self._stack.pop());
+                    _ = self._stack.pop();
+                    self.allocator.free(tag);
                 }
 
                 self._state = _content;

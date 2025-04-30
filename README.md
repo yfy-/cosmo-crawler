@@ -15,5 +15,5 @@ zig build -Doptimize=ReleaseFast
 
 ``` shell
 # Stripped content will be in stdout
-zig-out/bin/crawler <your_file>.html
+zig-out/bin/crawler <your_url>
 ```

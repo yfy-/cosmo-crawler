@@ -9,9 +9,14 @@ const http_header: std.http.Header = .{
 };
 
 fn Channel(comptime T: type) type {
+    const MessageTy = union {
+        message: T,
+        eos: void,
+    };
+
     return struct {
         const Self = @This();
-        const QueueType = std.fifo.LinearFifo(T, .Dynamic);
+        const QueueType = std.fifo.LinearFifo(MessageTy, .Dynamic);
 
         queue: QueueType,
         queue_mutex: std.Thread.Mutex = .{},
@@ -28,21 +33,23 @@ fn Channel(comptime T: type) type {
         // Send a message over the channel.
         fn send(self: *Self, elem: T) !void {
             self.queue_mutex.lock();
-            try self.queue.writeItem(elem);
+            try self.queue.writeItem(MessageTy{ .message = elem });
             self.queue_cond.signal();
             self.queue_mutex.unlock();
         }
 
         // Receive a message over the channel. Blocking until there is
         // a message.
-        fn receive(self: *Self) T {
+        fn receive(self: *Self) MessageTy {
             self.queue_mutex.lock();
             while (self.queue.readableLength() == 0) {
                 self.queue_cond.wait(&self.queue_mutex);
             }
 
+            if (self.queue.peekItem(self.queue.count - 1))
             const elem = self.queue.readItem().?;
             self.queue_mutex.unlock();
+
             return elem;
         }
     };
@@ -88,18 +95,18 @@ pub fn main() !void {
 
     _ = args.skip();
     const url = args.next().?;
-    var url_channel = Channel([]const u8).init(allocator);
+    var req_chnl = Channel([]const u8).init(allocator);
     var thread = try std.Thread.spawn(
         .{},
         requestor,
-        .{ url, &url_channel, allocator },
+        .{ url, &req_chnl, allocator },
     );
     defer thread.join();
 
     var stripper = HTMLStripper.init(allocator);
     defer stripper.deinit();
 
-    const html_text = url_channel.receive();
+    const html_text = req_chnl.receive();
     defer allocator.free(html_text);
 
     const html_cont = try stripper.strip(html_text);

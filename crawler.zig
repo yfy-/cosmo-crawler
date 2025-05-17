@@ -8,7 +8,7 @@ const http_header: std.http.Header = .{
         "+http://www.google.com/bot.html)",
 };
 
-fn Channel(comptime T: type) type {
+fn Channel(comptime T: type, comptime message_free: bool) type {
     const ChannelMessage = union(enum) {
         message: T,
         eos: void,
@@ -18,19 +18,32 @@ fn Channel(comptime T: type) type {
         const Self = @This();
         const QueueType = std.fifo.LinearFifo(ChannelMessage, .Dynamic);
 
+        allocator: Allocator,
         queue: QueueType,
         timeout_ns: u64,
         queue_mutex: std.Thread.Mutex = .{},
         queue_cond: std.Thread.Condition = .{},
 
+        /// Initialize a channel with timeout.
+        /// Thread unsafe.
         pub fn init(allocator: Allocator, timeout_ns: u64) Self {
             return Self{
+                .allocator = allocator,
                 .queue = QueueType.init(allocator),
                 .timeout_ns = timeout_ns,
             };
         }
 
+        /// Deinitialize a channel. Thread unsafe.
         pub fn deinit(self: *Self) void {
+            if (comptime message_free) {
+                while (self.queue.readItem()) |msg| {
+                    if (msg == .eos)
+                        continue;
+
+                    self.allocator.free(msg.message);
+                }
+            }
             self.queue.deinit();
         }
 
@@ -41,14 +54,14 @@ fn Channel(comptime T: type) type {
             self.queue_cond.signal();
         }
 
-        // Send a message over the channel.
+        /// Send a message over the channel. Thread safe.
         pub fn send(self: *Self, elem: *const T) !void {
             const msg = ChannelMessage{ .message = elem.* };
             try self._send(&msg);
         }
 
-        // Receive a message over the channel. Blocking until there is
-        // a message.
+        /// Receive a message over the channel. Blocking until there is
+        /// a message or timeout. Thread safe.
         pub fn receive(self: *Self) ChannelMessage {
             self.queue_mutex.lock();
             defer self.queue_mutex.unlock();
@@ -65,7 +78,7 @@ fn Channel(comptime T: type) type {
             return self.queue.readItem().?;
         }
 
-        // Close the channel. Receivers will be notified.
+        /// Close the channel to notify receivers. Thread safe.
         pub fn close(self: *Self) !void {
             const msg = ChannelMessage{ .eos = {} };
             try self._send(&msg);
@@ -73,7 +86,9 @@ fn Channel(comptime T: type) type {
     };
 }
 
-fn printer(print_channel: *Channel([]const u8), allocator: Allocator) !void {
+const StrChannel = Channel([]const u8, true);
+
+fn printer(print_channel: *StrChannel, allocator: Allocator) !void {
     var stdout = std.io.getStdOut().writer();
     while (true) {
         const print_msg = print_channel.receive();
@@ -86,9 +101,9 @@ fn printer(print_channel: *Channel([]const u8), allocator: Allocator) !void {
 }
 
 fn parser(
-    url_channel: *Channel([]const u8),
-    parse_channel: *Channel([]const u8),
-    print_channel: *Channel([]const u8),
+    url_channel: *StrChannel,
+    parse_channel: *StrChannel,
+    print_channel: *StrChannel,
     allocator: Allocator,
 ) !void {
     var stripper = HTMLStripper.init(allocator);
@@ -111,15 +126,15 @@ fn parser(
             return err;
         };
 
-        for (stripper.links.items) |link| {
+        for (try stripper.links.toOwnedSlice()) |link| {
             try url_channel.send(&link);
         }
     }
 }
 
 fn requestor(
-    req_channel: *Channel([]const u8),
-    parse_channel: *Channel([]const u8),
+    req_channel: *StrChannel,
+    parse_channel: *StrChannel,
     allocator: Allocator,
 ) !void {
     var http_client: std.http.Client = .{ .allocator = allocator };
@@ -134,27 +149,29 @@ fn requestor(
         errdefer html_text.deinit();
 
         std.debug.print("got={s}\n", .{url_msg.message});
-        const resp = try http_client.fetch(.{
+        const fetch_res = http_client.fetch(.{
             .location = .{ .url = url_msg.message },
             .method = .GET,
             .max_append_size = 5 * 1024 * 1024,
             .response_storage = .{ .dynamic = &html_text },
             .extra_headers = (&http_header)[0..1],
         });
-        if (resp.status != std.http.Status.ok) {
+
+        if (fetch_res) |resp| {
+            if (resp.status == std.http.Status.ok) {
+                try parse_channel.send(&@as([]const u8, try html_text.toOwnedSlice()));
+            } else {
+                defer html_text.deinit();
+                std.log.err("HTTP response not ok, url={s}, status={}", .{
+                    url_msg.message,
+                    resp.status,
+                });
+            }
+        } else |err| {
             defer html_text.deinit();
-            std.log.err("HTTP Request failed, url={s}, status={}", .{
-                url_msg.message,
-                resp.status,
-            });
-            continue;
+            std.log.err("HTTP fetch failed, url={s}, err={}", .{ url_msg.message, err });
         }
-
-        try parse_channel.send(&@as([]const u8, try html_text.toOwnedSlice()));
     }
-
-    // try url_channel.send(&@as([]const u8, try html_text.toOwnedSlice()));
-    // try url_channel.close();
 }
 
 pub fn main() !void {
@@ -172,7 +189,7 @@ pub fn main() !void {
     const seed_url = try allocator.alloc(u8, url_arg.len);
     std.mem.copyForwards(u8, seed_url, url_arg);
 
-    var req_chnl = Channel([]const u8).init(allocator, 500 * 1000 * 1000);
+    var req_chnl = StrChannel.init(allocator, 500 * 1000 * 1000);
     defer req_chnl.deinit();
 
     // Seed cannot be send.
@@ -181,10 +198,12 @@ pub fn main() !void {
         return err;
     };
 
-    var parse_chnl = Channel([]const u8).init(allocator, 500 * 1000 * 1000);
+    var parse_chnl = StrChannel.init(allocator, 5000 * 1000 * 1000);
     defer parse_chnl.deinit();
 
-    var print_chnl = Channel([]const u8).init(allocator, 500 * 1000 * 1000);
+    var print_chnl = StrChannel.init(allocator, 500 * 1000 * 1000);
+    defer print_chnl.deinit();
+
     var req_thread = try std.Thread.spawn(
         .{},
         requestor,

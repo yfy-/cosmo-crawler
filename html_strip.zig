@@ -16,6 +16,7 @@ pub const HTMLStripper = struct {
         HTMLAttrWithoutTag,
         HTMLWhitespaceBeforeTag,
         HTMLUnmatchedTag,
+        HTMLNoTag,
     };
     const Error = Allocator.Error || HTMLError || character_entity.Error;
 
@@ -109,6 +110,7 @@ pub const HTMLStripper = struct {
         self._tag_buffer.clearAndFree();
         self._attr_key_buffer.clearAndFree();
         self._attr_val_buffer.clearAndFree();
+        self._state = _beg;
     }
 
     /// Strip given html. Returned slice is owned by the caller.
@@ -124,11 +126,12 @@ pub const HTMLStripper = struct {
                 i += skip;
             } else |err| {
                 std.log.err(
-                    "Error {} at {s} with '{c}'",
+                    "Error {} at {s} with '{c}' at index '{d}'",
                     .{
                         err,
-                        html[@max(0, i - 100)..@min(i + 101, html.len - 1)],
+                        html[@max(0, i -| 100)..@min(i +| 101, html.len - 1)],
                         html[i],
+                        i,
                     },
                 );
                 return err;
@@ -163,36 +166,39 @@ pub const HTMLStripper = struct {
         content: *EntityAutoTranslator,
     ) Error!usize {
         const c = html[0];
-        const tag = self._stack.getLastOrNull().?;
-        if (c == '<') {
-            if (!AngleBracketTags.has(tag)) {
-                self._state = _tag;
+        if (self._stack.getLastOrNull()) |tag| {
+            if (c == '<') {
+                if (!AngleBracketTags.has(tag)) {
+                    self._state = _tag;
+                    return 1;
+                }
+
+                const tag_end_size = tag.len + 2;
+                if (html.len < tag_end_size) return error.HTMLParseError;
+                if (html[1] == '/' and
+                    std.mem.eql(u8, tag, html[2..tag_end_size]))
+                {
+                    try self._tag_buffer.appendSlice(tag);
+                    self._state = _tagEndFound;
+                    return tag_end_size;
+                }
+            }
+
+            if (IgnoreTags.has(tag))
                 return 1;
+
+            // Swap new lines with ordinary spaces since new lines can
+            // only be inserted with BlockLevelTags.
+            if (c == '\n' or c == '\r') {
+                try content.append(' ');
+            } else {
+                try content.append(c);
             }
 
-            const tag_end_size = tag.len + 2;
-            if (html.len < tag_end_size) return error.HTMLParseError;
-            if (html[1] == '/' and
-                std.mem.eql(u8, tag, html[2..tag_end_size]))
-            {
-                try self._tag_buffer.appendSlice(tag);
-                self._state = _tagEndFound;
-                return tag_end_size;
-            }
-        }
-
-        if (IgnoreTags.has(tag))
             return 1;
-
-        // Swap new lines with ordinary spaces since new lines can
-        // only be inserted with BlockLevelTags.
-        if (c == '\n' or c == '\r') {
-            try content.append(' ');
         } else {
-            try content.append(c);
+            return HTMLError.HTMLNoTag;
         }
-
-        return 1;
     }
 
     fn _tag(

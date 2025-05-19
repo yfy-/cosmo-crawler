@@ -71,7 +71,7 @@ fn Channel(comptime T: type, comptime message_free: bool) type {
                 };
             }
 
-            if (self.queue.peekItem(self.queue.head) == .eos) {
+            if (self.queue.peekItem(0) == .eos) {
                 return ChannelMessage.eos;
             }
 
@@ -88,7 +88,7 @@ fn Channel(comptime T: type, comptime message_free: bool) type {
 
 const StrChannel = Channel([]const u8, true);
 
-fn printer(print_channel: *StrChannel, allocator: Allocator) !void {
+fn printer(print_channel: *StrChannel, allocator: Allocator) void {
     var stdout = std.io.getStdOut().writer();
     while (true) {
         const print_msg = print_channel.receive();
@@ -96,7 +96,9 @@ fn printer(print_channel: *StrChannel, allocator: Allocator) !void {
             break;
 
         defer allocator.free(print_msg.message);
-        try stdout.print("{s}\n", .{print_msg.message});
+        stdout.print("{s}\n", .{print_msg.message}) catch |err| {
+            std.log.err("PRINTER: err={}", .{err});
+        };
     }
 }
 
@@ -105,10 +107,9 @@ fn parser(
     parse_channel: *StrChannel,
     print_channel: *StrChannel,
     allocator: Allocator,
-) !void {
+) void {
     var stripper = HTMLStripper.init(allocator);
     defer stripper.deinit();
-
     while (true) {
         const html_text_msg = parse_channel.receive();
         if (html_text_msg == .eos)
@@ -117,19 +118,46 @@ fn parser(
         const html_text = html_text_msg.message;
         defer allocator.free(html_text);
         const html_cont = stripper.strip(html_text) catch |err| {
-            std.log.err("Parse error {}", .{err});
+            std.log.err("PARSER: Parse err={}", .{err});
             continue;
         };
 
         print_channel.send(&html_cont) catch |err| {
-            allocator.free(html_cont);
-            return err;
+            defer allocator.free(html_cont);
+            std.log.err("PARSER: Could not send content, err={}", .{err});
+            continue;
         };
 
-        for (try stripper.links.toOwnedSlice()) |link| {
-            try url_channel.send(&link);
+        const links = stripper.links.toOwnedSlice() catch |err| {
+            std.log.err("PARSER: Could not own links, err={}", .{err});
+            continue;
+        };
+
+        for (links) |link| {
+            url_channel.send(&link) catch |err| {
+                std.log.err("PARSER: Could not send link={s}, err={}", .{ link, err });
+            };
         }
     }
+}
+
+const HttpClient = std.http.Client;
+const FetchChannel = Channel(anyerror!HttpClient.FetchResult, false);
+
+fn request_with_timeout(
+    client: *HttpClient,
+    url: []const u8,
+    html_text: *std.ArrayList(u8),
+    out_channel: *FetchChannel,
+) !void {
+    const fetch_res = client.fetch(.{
+        .location = .{ .url = url },
+        .method = .GET,
+        .max_append_size = 5 * 1024 * 1024,
+        .response_storage = .{ .dynamic = html_text },
+        .extra_headers = (&http_header)[0..1],
+    });
+    try out_channel.send(&fetch_res);
 }
 
 fn requestor(
@@ -137,39 +165,59 @@ fn requestor(
     parse_channel: *StrChannel,
     allocator: Allocator,
 ) !void {
-    var http_client: std.http.Client = .{ .allocator = allocator };
+    var http_client: HttpClient = .{ .allocator = allocator };
     defer http_client.deinit();
     while (true) {
         const url_msg = req_channel.receive();
         if (url_msg == .eos)
             break;
 
-        defer allocator.free(url_msg.message);
+        const url = url_msg.message;
+        defer allocator.free(url);
+
         var html_text = std.ArrayList(u8).init(allocator);
         errdefer html_text.deinit();
 
-        std.debug.print("got={s}\n", .{url_msg.message});
-        const fetch_res = http_client.fetch(.{
-            .location = .{ .url = url_msg.message },
-            .method = .GET,
-            .max_append_size = 5 * 1024 * 1024,
-            .response_storage = .{ .dynamic = &html_text },
-            .extra_headers = (&http_header)[0..1],
-        });
+        var fetch_chnl = FetchChannel.init(allocator, 5 * 1000 * 1000 * 1000);
+        defer fetch_chnl.deinit();
 
+        var fetch_thrd = std.Thread.spawn(
+            .{},
+            request_with_timeout,
+            .{
+                &http_client,
+                url,
+                &html_text,
+                &fetch_chnl,
+            },
+        ) catch |err| {
+            defer html_text.deinit();
+            std.log.err("REQUESTOR: Cannot spawn fetch thread, url={s}, err={}", .{ url, err });
+            continue;
+        };
+        defer fetch_thrd.join();
+
+        const fetch_thrd_ret = fetch_chnl.receive();
+        if (fetch_thrd_ret == .eos) {
+            defer html_text.deinit();
+            std.log.err("REQUESTOR: Fetch channel timedout, url={s}", .{url});
+            continue;
+        }
+
+        const fetch_res = fetch_thrd_ret.message;
         if (fetch_res) |resp| {
             if (resp.status == std.http.Status.ok) {
                 try parse_channel.send(&@as([]const u8, try html_text.toOwnedSlice()));
             } else {
                 defer html_text.deinit();
-                std.log.err("HTTP response not ok, url={s}, status={}", .{
-                    url_msg.message,
+                std.log.err("REQUESTOR: HTTP response not ok, url={s}, status={}", .{
+                    url,
                     resp.status,
                 });
             }
         } else |err| {
             defer html_text.deinit();
-            std.log.err("HTTP fetch failed, url={s}, err={}", .{ url_msg.message, err });
+            std.log.err("REQUESTOR: HTTP fetch failed, url={s}, err={}", .{ url, err });
         }
     }
 }
@@ -201,7 +249,7 @@ pub fn main() !void {
     var parse_chnl = StrChannel.init(allocator, 5000 * 1000 * 1000);
     defer parse_chnl.deinit();
 
-    var print_chnl = StrChannel.init(allocator, 500 * 1000 * 1000);
+    var print_chnl = StrChannel.init(allocator, 5000 * 1000 * 1000);
     defer print_chnl.deinit();
 
     var req_thread = try std.Thread.spawn(
@@ -223,5 +271,11 @@ pub fn main() !void {
         &print_chnl,
         allocator,
     });
-    defer print_thread.join();
+
+    req_thread.join();
+    std.log.debug("req thread stopped.", .{});
+    parse_thread.join();
+    std.log.debug("parse thread stopped.", .{});
+    print_thread.join();
+    std.log.debug("print thread stopped.", .{});
 }

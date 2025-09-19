@@ -8,6 +8,75 @@ const http_header: std.http.Header = .{
         "+http://www.google.com/bot.html)",
 };
 
+// FIXME: This does not work.
+// Need a different condition when buffer is empty or full.
+// Simply checking self.head == self.tail does not separate the two.
+fn RingBuffer(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        allocator: Allocator,
+        buffer: []T = &.{},
+        head: usize = 0,
+        tail: usize = 0,
+
+        pub fn init(allocator: Allocator) Self {
+            return Self{ .allocator = allocator };
+        }
+
+        pub fn deinit(self: *Self) void {
+            if (self.buffer.len > 0)
+                self.allocator.free(self.buffer);
+        }
+
+        fn grow(self: *Self) !void {
+            const new_len = 2 * self.buffer.len;
+            if (new_len == 0)
+                new_len = 8;
+
+            var new_buffer = try self.allocator.alloc(T, new_len);
+            for (0..self.buffer.len) |i| {
+                new_buffer[i] = self.buffer[(self.head + i) % self.capacity];
+            }
+            self.buffer = new_buffer;
+            self.head = 0;
+            self.tail = self.buffer.len;
+            self.deinit();
+        }
+
+        pub fn push(self: *Self, elem: T) !void {
+            if (self.head == self.tail)
+                try self.grow();
+
+            self.buffer[self.tail] = elem;
+            self.tail = (self.tail + 1) % self.buffer.len;
+        }
+
+        pub fn pop(self: *Self) ?T {
+            if (self.head == self.tail)
+                return null;
+
+            const elem_idx = self.head;
+            self.head = (self.head + 1) % self.buffer.len;
+            return self.buffer[elem_idx];
+        }
+
+        pub fn len(self: *Self) usize {
+            if (self.head <= self.tail)
+                return self.tail - self.head;
+
+            return self.buffer.len - self.head + self.tail;
+        }
+
+        pub fn peek(self: *Self) ?T {
+            if (self.head == self.tail)
+                return null;
+
+            return self.buffer[self.head];
+        }
+    };
+}
+
 fn Channel(comptime T: type, comptime message_free: bool) type {
     const ChannelMessage = union(enum) {
         message: T,
@@ -16,7 +85,7 @@ fn Channel(comptime T: type, comptime message_free: bool) type {
 
     return struct {
         const Self = @This();
-        const QueueType = std.fifo.LinearFifo(ChannelMessage, .Dynamic);
+        const QueueType = RingBuffer(ChannelMessage);
 
         allocator: Allocator,
         queue: QueueType,
@@ -39,7 +108,7 @@ fn Channel(comptime T: type, comptime message_free: bool) type {
         /// Deinitialize a channel. Thread unsafe.
         pub fn deinit(self: *Self) void {
             if (comptime message_free) {
-                while (self.queue.readItem()) |msg| {
+                while (self.queue.pop()) |msg| {
                     if (msg == .eos)
                         continue;
 
@@ -74,7 +143,7 @@ fn Channel(comptime T: type, comptime message_free: bool) type {
         fn _send(self: *Self, message: *const ChannelMessage) !void {
             self.queue_mutex.lock();
             defer self.queue_mutex.unlock();
-            try self.queue.writeItem(message.*);
+            try self.queue.push(message.*);
             self.queue_cond.signal();
         }
 
@@ -94,7 +163,7 @@ fn Channel(comptime T: type, comptime message_free: bool) type {
         pub fn receive(self: *Self, timeout_ns: ?u64) ChannelMessage {
             self.queue_mutex.lock();
             defer self.queue_mutex.unlock();
-            while (self.queue.readableLength() == 0) {
+            while (self.queue.len() == 0) {
                 if (timeout_ns) |t_ns| {
                     self.queue_cond.timedWait(
                         &self.queue_mutex,
@@ -407,27 +476,27 @@ fn fetchWithTimeout(
     };
 }
 
-// fn request_with_timeout(
-//     client: *HttpClient,
-//     url: []const u8,
-//     html_text: *std.ArrayList(u8),
-//     out_channel: *FetchChannel,
-// ) !void {
-//     const uri = try std.Uri.parse(url);
-//     var server_header_buffer: [16 * 1024]u8 = undefined;
-//     try client.open(.GET, uri, .{
-//         .server_header_buffer = &server_header_buffer,
-//         .extra_headers = (&http_header)[0..1],
-//     });
-//     const fetch_res = client.fetch(.{
-//         .location = .{ .url = url },
-//         .method = .GET,
-//         .max_append_size = 5 * 1024 * 1024,
-//         .response_storage = .{ .dynamic = html_text },
-//         .extra_headers = (&http_header)[0..1],
-//     });
-//     try out_channel.send(&fetch_res);
-// }
+fn request_with_timeout(
+    client: *HttpClient,
+    url: []const u8,
+    html_text: *std.ArrayList(u8),
+    out_channel: *FetchChannel,
+) !void {
+    const uri = try std.Uri.parse(url);
+    var server_header_buffer: [16 * 1024]u8 = undefined;
+    try client.open(.GET, uri, .{
+        .server_header_buffer = &server_header_buffer,
+        .extra_headers = (&http_header)[0..1],
+    });
+    const fetch_res = client.fetch(.{
+        .location = .{ .url = url },
+        .method = .GET,
+        .max_append_size = 5 * 1024 * 1024,
+        .response_storage = .{ .dynamic = html_text },
+        .extra_headers = (&http_header)[0..1],
+    });
+    try out_channel.send(&fetch_res);
+}
 
 fn requestor(
     req_channel: *PageChannel,

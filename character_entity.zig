@@ -2259,29 +2259,29 @@ pub const AutoTranslator = struct {
     pub fn init(allocator: Allocator, ignore_excess_space: bool) Self {
         return Self{
             .allocator = allocator,
-            .translated = CharList.init(allocator),
-            ._entity_buffer = CharList.init(allocator),
+            .translated = .{},
             .ignore_excess_space = ignore_excess_space,
+            ._entity_buffer = .{},
         };
     }
 
     /// De-initialize.
     pub fn deinit(self: *Self) void {
-        self.translated.deinit();
-        self._entity_buffer.deinit();
+        self.translated.deinit(self.allocator);
+        self._entity_buffer.deinit(self.allocator);
     }
 
     /// Clear and free buffers but the instance is usable afterwards.
     pub fn clearAndFree(self: *Self) void {
-        self.translated.clearAndFree();
-        self._entity_buffer.clearAndFree();
+        self.translated.clearAndFree(self.allocator);
+        self._entity_buffer.clearAndFree(self.allocator);
         self._in_entity = false;
     }
 
     /// Collect the translated buffer. Slice is owned by the client.
     pub fn toOwnedSlice(self: *Self) Allocator.Error![]u8 {
-        defer self.clearAndFree();
-        return self.translated.toOwnedSlice();
+        defer self.clearAndFree(self.allocator);
+        return self.translated.toOwnedSlice(self.allocator);
     }
 
     /// Append a character to be translated.
@@ -2292,24 +2292,24 @@ pub const AutoTranslator = struct {
         }
 
         if (self._in_entity and c == ';') {
-            defer self._entity_buffer.clearAndFree();
+            defer self._entity_buffer.clearAndFree(self.allocator);
             self._in_entity = false;
             const trans = try translateEntity(
                 self._entity_buffer.items,
                 self.allocator,
             );
             defer self.allocator.free(trans);
-            try self.translated.appendSlice(trans);
+            try self.translated.appendSlice(self.allocator, trans);
             return;
         }
 
         if (self._in_entity) {
-            try self._entity_buffer.append(c);
+            try self._entity_buffer.append(self.allocator, c);
             return;
         }
 
         if (!self.ignore_excess_space or !isASCIIWhite(c)) {
-            try self.translated.append(c);
+            try self.translated.append(self.allocator, c);
             return;
         }
 
@@ -2320,7 +2320,7 @@ pub const AutoTranslator = struct {
                     self.translated.items[self.translated.items.len - 1] = c;
                 }
             } else {
-                try self.translated.append(c);
+                try self.translated.append(self.allocator, c);
             }
         }
     }

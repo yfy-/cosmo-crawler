@@ -33,12 +33,17 @@ const Page = struct {
 
 const PageChannel = Channel(*Page, true);
 
-fn printer(print_channel: *PageChannel, allocator: Allocator) void {
-    var stdout = std.io.getStdOut().writer();
+fn printer(print_channel: *PageChannel, allocator: Allocator) !void {
+    var stdout_buffer: [1024 * 1024]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    const stdout = &stdout_writer.interface;
+
     while (true) {
         const page_msg = print_channel.receive(null);
-        if (page_msg == .eos)
+        if (page_msg == .eos) {
+            try stdout.flush();
             break;
+        }
 
         const page_ctx = page_msg.message;
         defer {
@@ -287,20 +292,18 @@ fn fetchWithTimeout(
 fn request_with_timeout(
     client: *HttpClient,
     url: []const u8,
-    html_text: *std.ArrayList(u8),
+    max_size: usize,
+    allocator: Allocator,
     out_channel: *FetchChannel,
-) !void {
-    const uri = try std.Uri.parse(url);
-    var server_header_buffer: [16 * 1024]u8 = undefined;
-    try client.open(.GET, uri, .{
-        .server_header_buffer = &server_header_buffer,
-        .extra_headers = (&http_header)[0..1],
-    });
-    const fetch_res = client.fetch(.{
+    io: std.Io,
+) ![]u8 {
+    const buf: []u8 = try allocator.alloc(u8, max_size);
+    errdefer allocator.free(buf);
+    var stream = std.io.Writer.fixed(buf);
+    const fetch_res = try client.fetch(.{
         .location = .{ .url = url },
         .method = .GET,
-        .max_append_size = 5 * 1024 * 1024,
-        .response_storage = .{ .dynamic = html_text },
+        .response_writer = &stream,
         .extra_headers = (&http_header)[0..1],
     });
     try out_channel.send(&fetch_res);
@@ -323,7 +326,7 @@ fn requestor(
         }
 
         const page_ctx = page_msg.message;
-        var html_arr = std.ArrayList(u8).init(allocator);
+        var html_arr = std.ArrayList(u8){};
 
         var fetch_chnl = FetchChannel.init(allocator);
         defer fetch_chnl.deinit();
@@ -369,18 +372,20 @@ fn requestor(
         const fetch_res = fetch_thrd_ret.message;
         if (fetch_res) |resp| {
             if (resp.status == std.http.Status.ok) {
-                page_ctx.html = html_arr.toOwnedSlice() catch |err| err_blk: {
-                    defer {
-                        html_arr.deinit();
-                        page_ctx.deinit();
-                        allocator.destroy(page_ctx);
-                    }
-                    std.log.err(
-                        "REQUESTOR: Could not own html buffer, url={s}, err={}",
-                        .{ page_ctx.url, err },
-                    );
-                    break :err_blk null;
-                };
+                page_ctx.html = html_arr.toOwnedSlice(allocator) catch |err|
+                    err_blk: {
+                        defer {
+                            html_arr.deinit();
+                            page_ctx.deinit();
+                            allocator.destroy(page_ctx);
+                        }
+                        std.log.err(
+                            "REQUESTOR: Could not own html buffer, url={s}, " ++
+                                "err={}",
+                            .{ page_ctx.url, err },
+                        );
+                        break :err_blk null;
+                    };
                 parse_channel.send(&page_ctx) catch |err| {
                     defer {
                         html_arr.deinit();

@@ -13,6 +13,10 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(crawler);
 
+    const dep_curl = b.dependency("curl", .{});
+    crawler.root_module.addImport("curl", dep_curl.module("curl"));
+    crawler.linkLibC();
+
     const crawler_check = b.addExecutable(.{
         .name = "crawler",
         .root_module = b.createModule(.{

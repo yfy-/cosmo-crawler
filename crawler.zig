@@ -2,18 +2,19 @@ const std = @import("std");
 const builtin = @import("builtin");
 const HTMLStripper = @import("html_strip.zig").HTMLStripper;
 const ds = @import("ds.zig");
+const curl = @import("curl");
+
 const Channel = ds.Channel;
 const Allocator = std.mem.Allocator;
-const http_header: std.http.Header = .{
-    .name = "User-Agent",
-    .value = "Mozilla/5.0 (compatible; Googlebot/2.1; " ++
+const http_header = [_][:0]const u8{
+    "User-Agent: Mozilla/5.0 (compatible; Googlebot/2.1; " ++
         "+http://www.google.com/bot.html)",
 };
 
 const Page = struct {
     const Self = @This();
 
-    url: []const u8,
+    url: [:0]const u8,
     depth: usize,
     allocator: Allocator,
     html: ?[]const u8 = null,
@@ -91,7 +92,7 @@ fn parser(
                 page_ctx.deinit();
                 allocator.destroy(page_ctx);
             }
-            std.log.err("PARSER: Received null url={s}", .{page_ctx.url});
+            std.log.err("PARSER: Received null html for url={s}", .{page_ctx.url});
             continue;
         }
 
@@ -107,34 +108,17 @@ fn parser(
             continue;
         };
 
-        const curr_depth = page_ctx.depth;
-        var curr_url = std.ArrayList(u8).initCapacity(
-            allocator,
-            page_ctx.url.len,
-        ) catch |err| {
-            defer {
-                page_ctx.deinit();
-                allocator.destroy(page_ctx);
-            }
+        // Copy the url before sending it to print. As printer will
+        // deallocate the pagectx it is not guaranteed we can get a
+        // copy afterwards.
+        var cp_url = std.ArrayList(u8).initBuffer(allocator.dupe(u8, page_ctx.url) catch |err| {
             std.log.err(
                 "PARSER: Could not allocate url array, err={}, url={s}",
                 .{ err, page_ctx.url },
             );
             continue;
-        };
-        defer curr_url.deinit();
-
-        curr_url.appendSlice(page_ctx.url) catch |err| {
-            defer {
-                page_ctx.deinit();
-                allocator.destroy(page_ctx);
-            }
-            std.log.err(
-                "PARSER: Could append to url array, err={}, url={s}",
-                .{ err, page_ctx.url },
-            );
-            continue;
-        };
+        });
+        defer cp_url.deinit(allocator);
 
         print_channel.send(&page_ctx) catch |err| {
             defer {
@@ -144,7 +128,12 @@ fn parser(
             std.log.err("PARSER: Could not send content, err={}", .{err});
         };
 
-        const links = stripper.links.toOwnedSlice() catch |err| {
+        const curr_depth = page_ctx.depth;
+        if (curr_depth == max_depth) {
+            continue;
+        }
+
+        const links = stripper.links.toOwnedSlice(allocator) catch |err| {
             std.log.err("PARSER: Could not own links, err={}", .{err});
             continue;
         };
@@ -155,30 +144,26 @@ fn parser(
             allocator.free(links);
         }
 
-        if (curr_depth == max_depth) {
-            continue;
-        }
-
         for (links) |link| {
             if (link.len == 0 or link[0] == '#') continue;
-            var new_link = std.ArrayList(u8).init(allocator);
-            defer new_link.deinit();
+            var new_link = std.ArrayList(u8){};
+            defer new_link.deinit(allocator);
 
             // Relative link.
             if (link[0] == '/') {
-                new_link.appendSlice(curr_url.items) catch |err| {
+                new_link.appendSlice(allocator, cp_url.items) catch |err| {
                     std.log.err(
                         "PARSER: Could not append to new link, err={}, url={s}",
-                        .{ err, curr_url.items },
+                        .{ err, cp_url.items },
                     );
                     continue;
                 };
             }
 
-            new_link.appendSlice(link) catch |err| {
+            new_link.appendSlice(allocator, link) catch |err| {
                 std.log.err(
                     "PARSER: Could not append to new link, err={}, url={s}",
-                    .{ err, curr_url.items },
+                    .{ err, cp_url.items },
                 );
                 continue;
             };
@@ -187,15 +172,15 @@ fn parser(
                 std.log.err(
                     "PARSER: Could not create page ctx, err={}, url={s}, " ++
                         "link={s}",
-                    .{ err, curr_url.items, new_link.items },
+                    .{ err, cp_url.items, new_link.items },
                 );
                 continue;
             };
 
-            const link_msg = new_link.toOwnedSlice() catch |err| {
+            const link_msg = new_link.toOwnedSliceSentinel(allocator, 0) catch |err| {
                 std.log.err(
                     "PARSER: Could own link msg, err={}, url={s}, link={s}",
-                    .{ err, curr_url.items, new_link.items },
+                    .{ err, cp_url.items, new_link.items },
                 );
                 continue;
             };
@@ -213,100 +198,11 @@ fn parser(
                 }
                 std.log.err(
                     "PARSER: Could not send page ctx err={}, url={s}, link={s}",
-                    .{ err, curr_url.items, new_link.items },
+                    .{ err, cp_url.items, new_link.items },
                 );
             };
         }
     }
-}
-
-const HttpClient = std.http.Client;
-const FetchChannel = Channel(anyerror!HttpClient.FetchResult, false);
-
-fn fetchWithTimeout(
-    client: *HttpClient,
-    options: std.http.FetchOptions,
-) !std.http.FetchResult {
-    const uri = switch (options.location) {
-        .url => |u| try std.Uri.parse(u),
-        .uri => |u| u,
-    };
-    var server_header_buffer: [16 * 1024]u8 = undefined;
-
-    const method: std.http.Method = options.method orelse
-        if (options.payload != null) .POST else .GET;
-
-    var req = try client.open(client, method, uri, .{
-        .server_header_buffer = options.server_header_buffer orelse
-            &server_header_buffer,
-        .redirect_behavior = options.redirect_behavior orelse
-            if (options.payload == null) @enumFromInt(3) else .unhandled,
-        .headers = options.headers,
-        .extra_headers = options.extra_headers,
-        .privileged_headers = options.privileged_headers,
-        .keep_alive = options.keep_alive,
-    });
-    defer req.deinit();
-
-    if (options.payload) |payload| req.transfer_encoding = .{
-        .content_length = payload.len,
-    };
-
-    try req.send();
-
-    if (options.payload) |payload| try req.writeAll(payload);
-
-    try req.finish();
-    try req.wait();
-
-    switch (options.response_storage) {
-        .ignore => {
-            // Take advantage of request internals to discard the response body
-            // and make the connection available for another request.
-            req.response.skip = true;
-            // No buffer is necessary when skipping.
-            std.assert(try req.transferRead(&.{}) == 0);
-        },
-        .dynamic => |list| {
-            const max_append_size = options.max_append_size orelse
-                2 * 1024 * 1024;
-            try req.reader().readAllArrayList(list, max_append_size);
-        },
-        .static => |list| {
-            const buf = b: {
-                const buf = list.unusedCapacitySlice();
-                if (options.max_append_size) |len| {
-                    if (len < buf.len) break :b buf[0..len];
-                }
-                break :b buf;
-            };
-            list.items.len += try req.reader().readAll(buf);
-        },
-    }
-
-    return .{
-        .status = req.response.status,
-    };
-}
-
-fn request_with_timeout(
-    client: *HttpClient,
-    url: []const u8,
-    max_size: usize,
-    allocator: Allocator,
-    out_channel: *FetchChannel,
-    io: std.Io,
-) ![]u8 {
-    const buf: []u8 = try allocator.alloc(u8, max_size);
-    errdefer allocator.free(buf);
-    var stream = std.io.Writer.fixed(buf);
-    const fetch_res = try client.fetch(.{
-        .location = .{ .url = url },
-        .method = .GET,
-        .response_writer = &stream,
-        .extra_headers = (&http_header)[0..1],
-    });
-    try out_channel.send(&fetch_res);
 }
 
 fn requestor(
@@ -314,8 +210,14 @@ fn requestor(
     parse_channel: *PageChannel,
     allocator: Allocator,
 ) !void {
-    var http_client: HttpClient = .{ .allocator = allocator };
-    defer http_client.deinit();
+    const ca_bundle = try curl.allocCABundle(allocator);
+    defer ca_bundle.deinit();
+
+    const curl_easy = try curl.Easy.init(.{
+        .ca_bundle = ca_bundle,
+    });
+    defer curl_easy.deinit();
+
     try parse_channel.subscribe_as_sender();
     while (true) {
         const page_msg = req_channel.receive(5_000_000_000);
@@ -326,91 +228,26 @@ fn requestor(
         }
 
         const page_ctx = page_msg.message;
-        var html_arr = std.ArrayList(u8){};
-
-        var fetch_chnl = FetchChannel.init(allocator);
-        defer fetch_chnl.deinit();
-
-        std.log.info("REQUESTOR: Requesting url={s}...", .{page_ctx.url});
-        var fetch_thrd = std.Thread.spawn(
-            .{},
-            request_with_timeout,
-            .{
-                &http_client,
-                page_ctx.url,
-                &html_arr,
-                &fetch_chnl,
-            },
-        ) catch |err| {
+        const txt_buffer = allocator.alloc(u8, 16 * 1024 * 1024) catch |err| {
             defer {
-                html_arr.deinit();
                 page_ctx.deinit();
                 allocator.destroy(page_ctx);
             }
             std.log.err(
-                "REQUESTOR: Cannot spawn fetch thread, url={s}, err={}",
+                "REQUESTOR: Allocation failed for, url={s}, err={}",
                 .{ page_ctx.url, err },
             );
             continue;
         };
-        defer fetch_thrd.detach();
+        var writer = std.Io.Writer.fixed(txt_buffer);
 
-        const fetch_thrd_ret = fetch_chnl.receive(5_000_000_000);
-        if (fetch_thrd_ret == .eos) {
+        std.log.info("REQUESTOR: Requesting url={s}...", .{page_ctx.url});
+        const resp = curl_easy.fetch(
+            page_ctx.url,
+            .{ .headers = &http_header, .writer = &writer },
+        ) catch |err| {
             defer {
-                html_arr.deinit();
-                page_ctx.deinit();
-                allocator.destroy(page_ctx);
-            }
-            std.log.err(
-                "REQUESTOR: Fetch channel timedout, url={s}",
-                .{page_ctx.url},
-            );
-            continue;
-        }
-
-        const fetch_res = fetch_thrd_ret.message;
-        if (fetch_res) |resp| {
-            if (resp.status == std.http.Status.ok) {
-                page_ctx.html = html_arr.toOwnedSlice(allocator) catch |err|
-                    err_blk: {
-                        defer {
-                            html_arr.deinit();
-                            page_ctx.deinit();
-                            allocator.destroy(page_ctx);
-                        }
-                        std.log.err(
-                            "REQUESTOR: Could not own html buffer, url={s}, " ++
-                                "err={}",
-                            .{ page_ctx.url, err },
-                        );
-                        break :err_blk null;
-                    };
-                parse_channel.send(&page_ctx) catch |err| {
-                    defer {
-                        html_arr.deinit();
-                        page_ctx.deinit();
-                        allocator.destroy(page_ctx);
-                    }
-                    std.log.err(
-                        "REQUESTOR: Could not send html, url={s}, err={}",
-                        .{ page_ctx.url, err },
-                    );
-                };
-            } else {
-                defer {
-                    html_arr.deinit();
-                    page_ctx.deinit();
-                    allocator.destroy(page_ctx);
-                }
-                std.log.err(
-                    "REQUESTOR: HTTP response not ok, url={s}, status={}",
-                    .{ page_ctx.url, resp.status },
-                );
-            }
-        } else |err| {
-            defer {
-                html_arr.deinit();
+                allocator.free(txt_buffer);
                 page_ctx.deinit();
                 allocator.destroy(page_ctx);
             }
@@ -418,7 +255,34 @@ fn requestor(
                 "REQUESTOR: HTTP fetch failed, url={s}, err={}",
                 .{ page_ctx.url, err },
             );
+            continue;
+        };
+
+        if (@as(std.http.Status, @enumFromInt(resp.status_code)) != std.http.Status.ok) {
+            defer {
+                allocator.free(txt_buffer);
+                page_ctx.deinit();
+                allocator.destroy(page_ctx);
+            }
+            std.log.err(
+                "REQUESTOR: HTTP response not ok, url={s}, status={}",
+                .{ page_ctx.url, resp.status_code },
+            );
+            continue;
         }
+
+        page_ctx.html = txt_buffer;
+        parse_channel.send(&page_ctx) catch |err| {
+            defer {
+                allocator.free(txt_buffer);
+                page_ctx.deinit();
+                allocator.destroy(page_ctx);
+            }
+            std.log.err(
+                "REQUESTOR: Could not send html, url={s}, err={}",
+                .{ page_ctx.url, err },
+            );
+        };
     }
 }
 
@@ -434,7 +298,7 @@ pub fn main() !void {
 
     _ = args.skip();
     const url_arg = args.next().?;
-    const seed_url = try allocator.alloc(u8, url_arg.len);
+    const seed_url = try allocator.allocSentinel(u8, url_arg.len, 0);
     std.mem.copyForwards(u8, seed_url, url_arg);
 
     var req_chnl = PageChannel.init(allocator);
@@ -445,6 +309,7 @@ pub fn main() !void {
         return err;
     };
     seed_page_ctx.* = .{ .url = seed_url, .depth = 0, .allocator = allocator };
+
     // Seed cannot be send.
     req_chnl.send(&seed_page_ctx) catch |err| {
         seed_page_ctx.deinit();
@@ -463,6 +328,8 @@ pub fn main() !void {
         requestor,
         .{ &req_chnl, &parse_chnl, allocator },
     );
+    defer req_thread.join();
+
     // var req2_thread = try std.Thread.spawn(
     //     .{},
     //     requestor,
@@ -477,16 +344,11 @@ pub fn main() !void {
         2,
         allocator,
     });
+    defer parse_thread.join();
 
     var print_thread = try std.Thread.spawn(.{}, printer, .{
         &print_chnl,
         allocator,
     });
-
-    req_thread.join();
-    std.log.debug("req thread stopped.", .{});
-    parse_thread.join();
-    std.log.debug("parse thread stopped.", .{});
-    print_thread.join();
-    std.log.debug("print thread stopped.", .{});
+    defer print_thread.join();
 }

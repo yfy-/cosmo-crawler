@@ -1,6 +1,286 @@
 const builtin = @import("builtin");
 const std = @import("std");
 
+pub const Error = error{
+    InvalidCharacterEntity,
+    Overflow,
+    InvalidCharacter,
+    OutOfMemory,
+};
+
+const Allocator = std.mem.Allocator;
+
+/// Translate the given HTML character entity.
+pub fn translateEntity(
+    entity: []const u8,
+    allocator: Allocator,
+) Error![]u8 {
+    if (entity.len < 2) {
+        if (!builtin.is_test)
+            std.log.err("Invalid character entity '{s}'.", .{entity});
+        return error.InvalidCharacterEntity;
+    }
+
+    var num_cps = [2]u21{ 0, 0 };
+    var cps_write: *const [2]u21 = &num_cps;
+    if (entity[0] == '#' and (entity[1] == 'x' or entity[1] == 'X')) {
+        num_cps[0] = try std.fmt.parseUnsigned(u21, entity[2..], 16);
+    } else if (entity[0] == '#') {
+        num_cps[0] = try std.fmt.parseUnsigned(u21, entity[1..], 10);
+    } else if (EncodingEntityMap.get(entity)) |*ent_cps| {
+        cps_write = ent_cps;
+    } else {
+        if (!builtin.is_test)
+            std.log.err("Invalid character entity '{s}'.", .{entity});
+        return error.InvalidCharacterEntity;
+    }
+
+    var res = std.ArrayList(u8){};
+    errdefer res.deinit(allocator);
+    const writer = res.writer(allocator);
+    for (cps_write) |cp| {
+        if (cp == 0)
+            break;
+
+        try std.fmt.format(writer, "{u}", .{cp});
+    }
+
+    return res.toOwnedSlice(allocator);
+}
+
+const talloc = std.testing.allocator;
+
+test "translateEntityDecimal" {
+    const act = try translateEntity("#8790", talloc);
+    defer talloc.free(act);
+    try std.testing.expectEqualStrings("≖", act);
+}
+
+test "translateEntityHex" {
+    const act = try translateEntity("#x2244", talloc);
+    defer talloc.free(act);
+    try std.testing.expectEqualStrings("≄", act);
+
+    const act2 = try translateEntity("#X2244", talloc);
+    defer talloc.free(act2);
+    try std.testing.expectEqualStrings("≄", act2);
+}
+
+test "translateEntityKeyword" {
+    const act = try translateEntity("Icy", talloc);
+    defer talloc.free(act);
+    try std.testing.expectEqualStrings("И", act);
+}
+
+test "translateEntityKeywordDoublePoint" {
+    const act = try translateEntity("nsupseteqq", talloc);
+    defer talloc.free(act);
+    try std.testing.expectEqualStrings("⫆̸", act);
+}
+
+test "translateEntityInvalidShort" {
+    try std.testing.expectError(
+        error.InvalidCharacterEntity,
+        translateEntity("a", talloc),
+    );
+}
+
+test "translateEntityInvalidHex" {
+    try std.testing.expectError(
+        error.InvalidCharacter,
+        translateEntity("#xGG00", talloc),
+    );
+}
+
+test "translateEntityOverflowDecimal" {
+    try std.testing.expectError(
+        error.Overflow,
+        translateEntity("#4194304", talloc),
+    );
+}
+
+test "translateEntityKeywordNonexistent" {
+    try std.testing.expectError(
+        error.InvalidCharacterEntity,
+        translateEntity("abcde", talloc),
+    );
+}
+
+const CharList = std.ArrayList(u8);
+
+pub fn isASCIIWhite(c: u8) bool {
+    return c == ' ' or (c >= '\t' and c <= '\r');
+}
+
+/// Allows appending characters to a buffer where html entities are
+/// translated automatically. Use append to add characters to the
+/// buffer then later collect the translated buffer using
+/// toOwnedSlice. If provided ignore_excess_space will allow
+/// consecutive spaces to be skipped in the translated buffer.
+pub const AutoTranslator = struct {
+    const Self = @This();
+
+    allocator: Allocator,
+    translated: CharList,
+    ignore_excess_space: bool,
+    _in_entity: bool = false,
+    _entity_buffer: CharList,
+
+    /// Initialize.
+    pub fn init(allocator: Allocator, ignore_excess_space: bool) Self {
+        return Self{
+            .allocator = allocator,
+            .translated = .{},
+            .ignore_excess_space = ignore_excess_space,
+            ._entity_buffer = .{},
+        };
+    }
+
+    /// De-initialize.
+    pub fn deinit(self: *Self) void {
+        self.translated.deinit(self.allocator);
+        self._entity_buffer.deinit(self.allocator);
+    }
+
+    /// Clear and free buffers but the instance is usable afterwards.
+    pub fn clearAndFree(self: *Self) void {
+        self.translated.clearAndFree(self.allocator);
+        self._entity_buffer.clearAndFree(self.allocator);
+        self._in_entity = false;
+    }
+
+    /// Collect the translated buffer. Slice is owned by the client.
+    pub fn toOwnedSlice(self: *Self) Allocator.Error![]u8 {
+        defer self.clearAndFree();
+        return self.translated.toOwnedSlice(self.allocator);
+    }
+
+    /// Append a character to be translated.
+    pub fn append(self: *Self, c: u8) !void {
+        if (!self._in_entity and c == '&') {
+            self._in_entity = true;
+            return;
+        }
+
+        if (self._in_entity and c == ';') {
+            defer self._entity_buffer.clearAndFree(self.allocator);
+            self._in_entity = false;
+            const trans = translateEntity(
+                self._entity_buffer.items,
+                self.allocator,
+            ) catch |err| switch (err) {
+                // If not a valid entity just append it literally.
+                error.InvalidCharacterEntity => try std.fmt.allocPrint(
+                    self.allocator,
+                    "&{s};",
+                    .{self._entity_buffer.items},
+                ),
+                else => return err,
+            };
+
+            defer self.allocator.free(trans);
+            try self.translated.appendSlice(self.allocator, trans);
+            return;
+        }
+
+        if (self._in_entity) {
+            try self._entity_buffer.append(self.allocator, c);
+            return;
+        }
+
+        if (!self.ignore_excess_space or !isASCIIWhite(c)) {
+            try self.translated.append(self.allocator, c);
+            return;
+        }
+
+        if (self.translated.getLastOrNull()) |last_c| {
+            if (isASCIIWhite(last_c)) {
+                // Switch last whitespace to new line when we see a new line.
+                if (c == '\n') {
+                    self.translated.items[self.translated.items.len - 1] = c;
+                }
+            } else {
+                try self.translated.append(self.allocator, c);
+            }
+        }
+    }
+};
+
+test "auto_translator_no_ignore" {
+    var t = AutoTranslator.init(talloc, false);
+    defer t.deinit();
+    for ("abc &amp;  def\t &lt;&gt;  ") |c| {
+        try t.append(c);
+    }
+    try std.testing.expectEqualStrings("abc &  def\t <>  ", t.translated.items);
+}
+
+test "auto_translator_ignore" {
+    var t = AutoTranslator.init(talloc, true);
+    defer t.deinit();
+    for ("abc &amp;  def\t &lt;&gt;  ") |c| {
+        try t.append(c);
+    }
+    try std.testing.expectEqualStrings("abc & def\t<> ", t.translated.items);
+}
+
+test "auto_translator_reuse" {
+    var t = AutoTranslator.init(talloc, false);
+    defer t.deinit();
+    for ("abc &amp; ") |c| {
+        try t.append(c);
+    }
+    try std.testing.expectEqualStrings("abc & ", t.translated.items);
+    t.clearAndFree();
+    for ("def &lt; &gt; ") |c| {
+        try t.append(c);
+    }
+    try std.testing.expectEqualStrings("def < > ", t.translated.items);
+}
+
+test "auto_translator_to_owned_slice" {
+    var t = AutoTranslator.init(talloc, false);
+    defer t.deinit();
+    {
+        for ("abc &amp; ") |c| {
+            try t.append(c);
+        }
+
+        const res = try t.toOwnedSlice();
+        defer talloc.free(res);
+        try std.testing.expectEqualStrings("abc & ", res);
+    }
+
+    {
+        for ("def &lt; &gt; ") |c| {
+            try t.append(c);
+        }
+
+        const res = try t.toOwnedSlice();
+        defer talloc.free(res);
+        try std.testing.expectEqualStrings("def < > ", res);
+    }
+}
+
+test "auto_translator_new_line_overrides" {
+    var t = AutoTranslator.init(talloc, true);
+    defer t.deinit();
+    for ("abc \n &amp;") |c| {
+        try t.append(c);
+    }
+    try std.testing.expectEqualStrings("abc\n&", t.translated.items);
+}
+
+test "auto_translator_invalid_entity_appended_literally" {
+    var t = AutoTranslator.init(talloc, true);
+    defer t.deinit();
+    const ie = "&xabxr0156;";
+    for ("abc \n " ++ ie) |c| {
+        try t.append(c);
+    }
+    try std.testing.expectEqualStrings("abc\n" ++ ie, t.translated.items);
+}
+
 pub const EncodingEntityMap = std.StaticStringMap([2]u21).initComptime(
     .{
         .{ "Tab", .{ 0x0009, 0 } },
@@ -2130,263 +2410,3 @@ pub const EncodingEntityMap = std.StaticStringMap([2]u21).initComptime(
         .{ "zopf", .{ 0x1D56B, 0 } },
     },
 );
-
-pub const Error = error{
-    InvalidCharacterEntity,
-    Overflow,
-    InvalidCharacter,
-    OutOfMemory,
-};
-
-const Allocator = std.mem.Allocator;
-
-pub fn translateEntity(
-    entity: []const u8,
-    allocator: Allocator,
-) Error![]u8 {
-    if (entity.len < 2) {
-        if (!builtin.is_test)
-            std.log.err("Invalid character entity '{s}'.", .{entity});
-        return error.InvalidCharacterEntity;
-    }
-
-    var num_cps = [2]u21{ 0, 0 };
-    var cps_write: *const [2]u21 = &num_cps;
-    if (entity[0] == '#' and (entity[1] == 'x' or entity[1] == 'X')) {
-        num_cps[0] = try std.fmt.parseUnsigned(u21, entity[2..], 16);
-    } else if (entity[0] == '#') {
-        num_cps[0] = try std.fmt.parseUnsigned(u21, entity[1..], 10);
-    } else if (EncodingEntityMap.get(entity)) |*ent_cps| {
-        cps_write = ent_cps;
-    } else {
-        if (!builtin.is_test)
-            std.log.err("Invalid character entity '{s}'.", .{entity});
-        return error.InvalidCharacterEntity;
-    }
-
-    var res = std.ArrayList(u8).init(allocator);
-    errdefer res.deinit();
-    const writer = res.writer();
-    for (cps_write) |cp| {
-        if (cp == 0)
-            break;
-
-        try std.fmt.format(writer, "{u}", .{cp});
-    }
-
-    return res.toOwnedSlice();
-}
-
-const talloc = std.testing.allocator;
-
-test "translateEntityDecimal" {
-    const act = try translateEntity("#8790", talloc);
-    defer talloc.free(act);
-    try std.testing.expectEqualStrings("≖", act);
-}
-
-test "translateEntityHex" {
-    const act = try translateEntity("#x2244", talloc);
-    defer talloc.free(act);
-    try std.testing.expectEqualStrings("≄", act);
-
-    const act2 = try translateEntity("#X2244", talloc);
-    defer talloc.free(act2);
-    try std.testing.expectEqualStrings("≄", act2);
-}
-
-test "translateEntityKeyword" {
-    const act = try translateEntity("Icy", talloc);
-    defer talloc.free(act);
-    try std.testing.expectEqualStrings("И", act);
-}
-
-test "translateEntityKeywordDoublePoint" {
-    const act = try translateEntity("nsupseteqq", talloc);
-    defer talloc.free(act);
-    try std.testing.expectEqualStrings("⫆̸", act);
-}
-
-test "translateEntityInvalidShort" {
-    try std.testing.expectError(
-        error.InvalidCharacterEntity,
-        translateEntity("a", talloc),
-    );
-}
-
-test "translateEntityInvalidHex" {
-    try std.testing.expectError(
-        error.InvalidCharacter,
-        translateEntity("#xGG00", talloc),
-    );
-}
-
-test "translateEntityOverflowDecimal" {
-    try std.testing.expectError(
-        error.Overflow,
-        translateEntity("#4194304", talloc),
-    );
-}
-
-test "translateEntityKeywordNonexistent" {
-    try std.testing.expectError(
-        error.InvalidCharacterEntity,
-        translateEntity("abcde", talloc),
-    );
-}
-
-const CharList = std.ArrayList(u8);
-
-pub fn isASCIIWhite(c: u8) bool {
-    return c == ' ' or (c >= '\t' and c <= '\r');
-}
-
-/// Allows appending characters to a buffer where html entities are
-/// translated automatically. Use append to add characters to the
-/// buffer then later collect the translated buffer using
-/// toOwnedSlice. If provided ignore_excess_space will allow
-/// consecutive spaces to be skipped in the translated buffer.
-pub const AutoTranslator = struct {
-    const Self = @This();
-
-    allocator: Allocator,
-    translated: CharList,
-    ignore_excess_space: bool,
-    _in_entity: bool = false,
-    _entity_buffer: CharList,
-
-    /// Initialize.
-    pub fn init(allocator: Allocator, ignore_excess_space: bool) Self {
-        return Self{
-            .allocator = allocator,
-            .translated = .{},
-            .ignore_excess_space = ignore_excess_space,
-            ._entity_buffer = .{},
-        };
-    }
-
-    /// De-initialize.
-    pub fn deinit(self: *Self) void {
-        self.translated.deinit(self.allocator);
-        self._entity_buffer.deinit(self.allocator);
-    }
-
-    /// Clear and free buffers but the instance is usable afterwards.
-    pub fn clearAndFree(self: *Self) void {
-        self.translated.clearAndFree(self.allocator);
-        self._entity_buffer.clearAndFree(self.allocator);
-        self._in_entity = false;
-    }
-
-    /// Collect the translated buffer. Slice is owned by the client.
-    pub fn toOwnedSlice(self: *Self) Allocator.Error![]u8 {
-        defer self.clearAndFree(self.allocator);
-        return self.translated.toOwnedSlice(self.allocator);
-    }
-
-    /// Append a character to be translated.
-    pub fn append(self: *Self, c: u8) !void {
-        if (!self._in_entity and c == '&') {
-            self._in_entity = true;
-            return;
-        }
-
-        if (self._in_entity and c == ';') {
-            defer self._entity_buffer.clearAndFree(self.allocator);
-            self._in_entity = false;
-            const trans = try translateEntity(
-                self._entity_buffer.items,
-                self.allocator,
-            );
-            defer self.allocator.free(trans);
-            try self.translated.appendSlice(self.allocator, trans);
-            return;
-        }
-
-        if (self._in_entity) {
-            try self._entity_buffer.append(self.allocator, c);
-            return;
-        }
-
-        if (!self.ignore_excess_space or !isASCIIWhite(c)) {
-            try self.translated.append(self.allocator, c);
-            return;
-        }
-
-        if (self.translated.getLastOrNull()) |last_c| {
-            if (isASCIIWhite(last_c)) {
-                // Switch last whitespace to new line when we see a new line.
-                if (c == '\n') {
-                    self.translated.items[self.translated.items.len - 1] = c;
-                }
-            } else {
-                try self.translated.append(self.allocator, c);
-            }
-        }
-    }
-};
-
-test "auto_translator_no_ignore" {
-    var t = AutoTranslator.init(talloc, false);
-    defer t.deinit();
-    for ("abc &amp;  def\t &lt;&gt;  ") |c| {
-        try t.append(c);
-    }
-    try std.testing.expectEqualStrings("abc &  def\t <>  ", t.translated.items);
-}
-
-test "auto_translator_ignore" {
-    var t = AutoTranslator.init(talloc, true);
-    defer t.deinit();
-    for ("abc &amp;  def\t &lt;&gt;  ") |c| {
-        try t.append(c);
-    }
-    try std.testing.expectEqualStrings("abc & def\t<> ", t.translated.items);
-}
-
-test "auto_translator_reuse" {
-    var t = AutoTranslator.init(talloc, false);
-    defer t.deinit();
-    for ("abc &amp; ") |c| {
-        try t.append(c);
-    }
-    try std.testing.expectEqualStrings("abc & ", t.translated.items);
-    t.clearAndFree();
-    for ("def &lt; &gt; ") |c| {
-        try t.append(c);
-    }
-    try std.testing.expectEqualStrings("def < > ", t.translated.items);
-}
-
-test "auto_translator_to_owned_slice" {
-    var t = AutoTranslator.init(talloc, false);
-    defer t.deinit();
-    {
-        for ("abc &amp; ") |c| {
-            try t.append(c);
-        }
-
-        const res = try t.toOwnedSlice();
-        defer talloc.free(res);
-        try std.testing.expectEqualStrings("abc & ", res);
-    }
-
-    {
-        for ("def &lt; &gt; ") |c| {
-            try t.append(c);
-        }
-
-        const res = try t.toOwnedSlice();
-        defer talloc.free(res);
-        try std.testing.expectEqualStrings("def < > ", res);
-    }
-}
-
-test "auto_translator_new_line_overrides" {
-    var t = AutoTranslator.init(talloc, true);
-    defer t.deinit();
-    for ("abc \n &amp;") |c| {
-        try t.append(c);
-    }
-    try std.testing.expectEqualStrings("abc\n&", t.translated.items);
-}

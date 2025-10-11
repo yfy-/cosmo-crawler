@@ -1,0 +1,12 @@
+.{
+    .name = .cosmo_search,
+    .version = "0.15.1",
+    .dependencies = .{
+        .curl = .{
+            .url = "https://github.com/jiacai2050/zig-curl/archive/refs/tags/v0.3.2.zip",
+            .hash = "curl-0.3.2-P4tT4SXPAACuV6f5eyh4jG_1SspjWwMm_vRJfoKrQep5",
+        },
+    },
+    .paths = .{""},
+    .fingerprint = 0x8e03134cf30627cc,
+}

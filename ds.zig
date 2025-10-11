@@ -203,7 +203,7 @@ pub fn Channel(comptime T: type, comptime message_free: bool) type {
                 }
             }
 
-            if (self.queue.peek() == .eos) {
+            if (self.queue.peek().? == .eos) {
                 return ChannelMessage.eos;
             }
 

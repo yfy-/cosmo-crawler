@@ -1,11 +1,14 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
-const HTMLStripper = @import("html_strip.zig").HTMLStripper;
-const ds = @import("ds.zig");
+
 const curl = @import("curl");
 
+const ds = @import("ds.zig");
 const Channel = ds.Channel;
-const Allocator = std.mem.Allocator;
+const HostInfo = @import("HostInfo.zig");
+const HTMLStripper = @import("html_strip.zig").HTMLStripper;
+
 const http_header = [_][:0]const u8{
     "User-Agent: Mozilla/5.0 (compatible; Googlebot/2.1; " ++
         "+http://www.google.com/bot.html)",
@@ -287,68 +290,70 @@ fn requestor(
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
-    const allocator = gpa.allocator();
-    defer {
-        if (gpa.deinit() == .leak) @panic("mem leak");
-    }
+    // var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
+    // const allocator = gpa.allocator();
+    // defer {
+    //     if (gpa.deinit() == .leak) @panic("mem leak");
+    // }
 
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
+    _ = try HostInfo.init("/tmp/test_rocksdb");
 
-    _ = args.skip();
-    const url_arg = args.next().?;
-    const seed_url = try allocator.allocSentinel(u8, url_arg.len, 0);
-    std.mem.copyForwards(u8, seed_url, url_arg);
+    // var args = try std.process.argsWithAllocator(allocator);
+    // defer args.deinit();
 
-    var req_chnl = PageChannel.init(allocator);
-    defer req_chnl.deinit();
+    // _ = args.skip();
+    // const url_arg = args.next().?;
+    // const seed_url = try allocator.allocSentinel(u8, url_arg.len, 0);
+    // std.mem.copyForwards(u8, seed_url, url_arg);
 
-    var seed_page_ctx = allocator.create(Page) catch |err| {
-        allocator.free(seed_url);
-        return err;
-    };
-    seed_page_ctx.* = .{ .url = seed_url, .depth = 0, .allocator = allocator };
+    // var req_chnl = PageChannel.init(allocator);
+    // defer req_chnl.deinit();
 
-    // Seed cannot be send.
-    req_chnl.send(&seed_page_ctx) catch |err| {
-        seed_page_ctx.deinit();
-        allocator.destroy(seed_page_ctx);
-        return err;
-    };
+    // var seed_page_ctx = allocator.create(Page) catch |err| {
+    //     allocator.free(seed_url);
+    //     return err;
+    // };
+    // seed_page_ctx.* = .{ .url = seed_url, .depth = 0, .allocator = allocator };
 
-    var parse_chnl = PageChannel.init(allocator);
-    defer parse_chnl.deinit();
+    // // Seed cannot be send.
+    // req_chnl.send(&seed_page_ctx) catch |err| {
+    //     seed_page_ctx.deinit();
+    //     allocator.destroy(seed_page_ctx);
+    //     return err;
+    // };
 
-    var print_chnl = PageChannel.init(allocator);
-    defer print_chnl.deinit();
+    // var parse_chnl = PageChannel.init(allocator);
+    // defer parse_chnl.deinit();
 
-    var req_thread = try std.Thread.spawn(
-        .{},
-        requestor,
-        .{ &req_chnl, &parse_chnl, allocator },
-    );
-    defer req_thread.join();
+    // var print_chnl = PageChannel.init(allocator);
+    // defer print_chnl.deinit();
 
-    // var req2_thread = try std.Thread.spawn(
+    // var req_thread = try std.Thread.spawn(
     //     .{},
     //     requestor,
     //     .{ &req_chnl, &parse_chnl, allocator },
     // );
-    // defer req2_thread.join();
+    // defer req_thread.join();
 
-    var parse_thread = try std.Thread.spawn(.{}, parser, .{
-        &req_chnl,
-        &parse_chnl,
-        &print_chnl,
-        2,
-        allocator,
-    });
-    defer parse_thread.join();
+    // // var req2_thread = try std.Thread.spawn(
+    // //     .{},
+    // //     requestor,
+    // //     .{ &req_chnl, &parse_chnl, allocator },
+    // // );
+    // // defer req2_thread.join();
 
-    var print_thread = try std.Thread.spawn(.{}, printer, .{
-        &print_chnl,
-        allocator,
-    });
-    defer print_thread.join();
+    // var parse_thread = try std.Thread.spawn(.{}, parser, .{
+    //     &req_chnl,
+    //     &parse_chnl,
+    //     &print_chnl,
+    //     2,
+    //     allocator,
+    // });
+    // defer parse_thread.join();
+
+    // var print_thread = try std.Thread.spawn(.{}, printer, .{
+    //     &print_chnl,
+    //     allocator,
+    // });
+    // defer print_thread.join();
 }

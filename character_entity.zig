@@ -16,8 +16,6 @@ pub fn translateEntity(
     allocator: Allocator,
 ) Error![]u8 {
     if (entity.len < 2) {
-        if (!builtin.is_test)
-            std.log.err("Invalid character entity '{s}'.", .{entity});
         return error.InvalidCharacterEntity;
     }
 
@@ -30,8 +28,6 @@ pub fn translateEntity(
     } else if (EncodingEntityMap.get(entity)) |*ent_cps| {
         cps_write = ent_cps;
     } else {
-        if (!builtin.is_test)
-            std.log.err("Invalid character entity '{s}'.", .{entity});
         return error.InvalidCharacterEntity;
     }
 

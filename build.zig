@@ -17,16 +17,7 @@ pub fn build(b: *std.Build) void {
     crawler.root_module.addImport("curl", dep_curl.module("curl"));
     crawler.linkLibC();
 
-    const crawler_check = b.addExecutable(.{
-        .name = "crawler",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("crawler.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const check = b.step("check", "Check if project compiles.");
-    check.dependOn(&crawler_check.step);
+    crawler.linkSystemLibrary("rocksdb");
 
     const install_docs = b.addInstallDirectory(.{
         .source_dir = crawler.getEmittedDocs(),

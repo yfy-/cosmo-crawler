@@ -6,7 +6,7 @@ const curl = @import("curl");
 
 const ds = @import("ds.zig");
 const Channel = ds.Channel;
-const HostInfo = @import("HostInfo.zig");
+const PageInfo = @import("PageInfo.zig");
 const HTMLStripper = @import("html_strip.zig").HTMLStripper;
 
 const http_header = [_][:0]const u8{
@@ -289,15 +289,19 @@ fn requestor(
     }
 }
 
+const Dummy = struct { x: i32, y: f64, z: []const u8 };
+
 pub fn main() !void {
-    // var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
-    // const allocator = gpa.allocator();
-    // defer {
-    //     if (gpa.deinit() == .leak) @panic("mem leak");
-    // }
+    var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
+    const allocator = gpa.allocator();
+    defer {
+        if (gpa.deinit() == .leak) @panic("mem leak");
+    }
 
-    _ = try HostInfo.init("/tmp/test_rocksdb");
+    const buf = try PageInfo.serialize(Dummy, allocator, &Dummy{ .x = 5, .y = 3.0, .z = "erman" });
+    defer allocator.free(buf);
 
+    std.debug.print("Buf : {s}\n", .{buf});
     // var args = try std.process.argsWithAllocator(allocator);
     // defer args.deinit();
 

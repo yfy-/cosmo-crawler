@@ -7,21 +7,86 @@ const c = @cImport({
 const Self = @This();
 // db_path: [*c]const u8,
 db: *c.rocksdb_t = undefined,
-db_opts: *c.rocksdb_options_t = null,
-write_opts: *c.rocksdb_writeoptions_t = null,
-read_opts: *c.rocksdb_readoptions_t = null,
+db_opts: *c.rocksdb_options_t = undefined,
+write_opts: *c.rocksdb_writeoptions_t = undefined,
+read_opts: *c.rocksdb_readoptions_t = undefined,
+
+pub fn serialize(comptime T: type, allocator: std.mem.Allocator, value: *const T) ![]u8 {
+    if (@typeInfo(T) != .@"struct") {
+        @compileError("can only serialize structs");
+    }
+
+    var total_sz: usize = 0;
+    const t_fields = std.meta.fields(T);
+    inline for (t_fields, 0..) |f, i| {
+        switch (@typeInfo(f.type)) {
+            inline .bool, .int, .float => total_sz += @sizeOf(f.type),
+            inline .pointer => |ti| {
+                if (ti.size != .slice) @compileError("pointer field types must be slices");
+                const child_ti = @typeInfo(ti.child);
+                if (child_ti != .bool and child_ti != .int and child_ti != .float) {
+                    @compileError("slice child type must be primitive");
+                }
+
+                total_sz += @field(value, f.name).len * @sizeOf(ti.child);
+                if (i < t_fields.len - 1) {
+                    total_sz += @sizeOf(usize);
+                }
+            },
+            else => |ti| @compileError(
+                "only primitive or slice field types are supported, got " ++ @tagName(ti),
+            ),
+        }
+    }
+
+    std.debug.print("Total sz: {}", .{total_sz});
+    const buf = try allocator.alloc(u8, total_sz);
+    errdefer allocator.free(buf);
+
+    var offset: usize = 0;
+    inline for (t_fields, 0..) |f, i| {
+        switch (@typeInfo(f.type)) {
+            inline .pointer => |ti| {
+                const slice = @field(value, f.name);
+                if (i < t_fields.len - 1) {
+                    const len_size = @sizeOf(usize);
+                    @memcpy(
+                        buf[offset .. offset + len_size],
+                        std.mem.asBytes(&slice.len),
+                    );
+                    offset += len_size;
+                }
+
+                for (slice) |e| {
+                    const e_size = @sizeOf(ti.child);
+                    @memcpy(buf[offset .. offset + e_size], std.mem.asBytes(&e));
+                    offset += e_size;
+                }
+            },
+            inline else => {
+                const f_size = @sizeOf(f.type);
+                @memcpy(buf[offset .. offset + f_size], std.mem.asBytes(&@field(value, f.name)));
+                offset += f_size;
+            },
+        }
+    }
+    return buf;
+}
 
 const PageMeta = struct {
     last_crawled: u64,
     etag_fp: u64,
     crawl_period: u32,
     url: []u8,
+    content: []u8,
 
     pub fn serialize(self: @This(), allocator: std.mem.Allocator) ![]u8 {
         const sz_last = @sizeOf(@TypeOf(self.last_crawled));
         const sz_etag = @sizeOf(@TypeOf(self.etag_fp));
         const sz_period = @sizeOf(@TypeOf(self.crawl_period));
-        const sz_page = sz_last + sz_etag + sz_period + self.url.len;
+        const sz_url = @sizeOf(@TypeOf(self.content.len)) + self.url.len;
+        const sz_content = self.content.len;
+        const sz_page = sz_last + sz_etag + sz_period + sz_url + sz_content;
         const buffer = try allocator.alloc(u8, sz_page);
         errdefer allocator.free(buffer);
 
@@ -134,30 +199,30 @@ pub fn deinit(self: Self) void {
     c.rocksdb_close(self.db);
 }
 
-pub fn set_page(self: Self) !u128 {
-    const key = "erman";
-    const value = "yafay";
-    c.rocksdb_put(
-        self.db,
-        self.write_opts,
-        @ptrCast(key.ptr),
-        key.len,
-        @ptrCast(value.ptr),
-        value.len,
-        err,
-    );
-    if (err != null) {
-        std.debug.print("Put error: {s}", .{err});
-        return err.PutError;
-    }
-}
+// pub fn set_page(self: Self) !u128 {
+//     const key = "erman";
+//     const value = "yafay";
+//     c.rocksdb_put(
+//         self.db,
+//         self.write_opts,
+//         @ptrCast(key.ptr),
+//         key.len,
+//         @ptrCast(value.ptr),
+//         value.len,
+//         err,
+//     );
+//     if (err != null) {
+//         std.debug.print("Put error: {s}", .{err});
+//         return err.PutError;
+//     }
+// }
 
-pub fn get_page(self: Self, page_id: u128) !PageMeta {
-    var read_len: usize = undefined;
-    const read_value = c.rocksdb_get(db, read_opts, @ptrCast(key.ptr), key.len, &read_len, err);
-    if (err != null) {
-        std.debug.print("Get error: {s}", .{err});
-        return err.GetError;
-    }
-    defer c.rocksdb_free(read_value);
-}
+// pub fn get_page(self: Self, page_id: u128) !PageMeta {
+//     var read_len: usize = undefined;
+//     const read_value = c.rocksdb_get(db, read_opts, @ptrCast(key.ptr), key.len, &read_len, err);
+//     if (err != null) {
+//         std.debug.print("Get error: {s}", .{err});
+//         return err.GetError;
+//     }
+//     defer c.rocksdb_free(read_value);
+// }

@@ -289,7 +289,7 @@ fn requestor(
     }
 }
 
-const Dummy = struct { x: i32, y: f64, z: []const u8 };
+const Dummy = struct { x: i32, y: f64, z: []u8 };
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
@@ -298,10 +298,23 @@ pub fn main() !void {
         if (gpa.deinit() == .leak) @panic("mem leak");
     }
 
-    const buf = try PageInfo.serialize(Dummy, allocator, &Dummy{ .x = 5, .y = 3.0, .z = "erman" });
+    var z_buf: [5]u8 = undefined;
+    @memcpy(&z_buf, "erman");
+    const buf = try PageInfo.serialize(
+        Dummy,
+        allocator,
+        &Dummy{ .x = 5, .y = 3.0, .z = &z_buf },
+    );
     defer allocator.free(buf);
 
-    std.debug.print("Buf : {s}\n", .{buf});
+    const dummy_ptr = try PageInfo.deserialize(Dummy, allocator, buf);
+    defer allocator.free(dummy_ptr.z);
+    defer allocator.destroy(dummy_ptr);
+
+    std.debug.print("x: {}\n", .{dummy_ptr.x});
+    std.debug.print("y: {}\n", .{dummy_ptr.y});
+    std.debug.print("z: {s}\n", .{dummy_ptr.z});
+
     // var args = try std.process.argsWithAllocator(allocator);
     // defer args.deinit();
 

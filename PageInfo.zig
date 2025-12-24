@@ -11,26 +11,19 @@ db_opts: *c.rocksdb_options_t = undefined,
 write_opts: *c.rocksdb_writeoptions_t = undefined,
 read_opts: *c.rocksdb_readoptions_t = undefined,
 
-pub fn serialize(comptime T: type, allocator: std.mem.Allocator, value: *const T) ![]u8 {
+pub fn check_type_serializable(comptime T: type) void {
     if (@typeInfo(T) != .@"struct") {
         @compileError("can only serialize structs");
     }
 
-    var total_sz: usize = 0;
-    const t_fields = std.meta.fields(T);
-    inline for (t_fields, 0..) |f, i| {
+    inline for (std.meta.fields(T)) |f| {
         switch (@typeInfo(f.type)) {
-            inline .bool, .int, .float => total_sz += @sizeOf(f.type),
+            inline .bool, .int, .float => {},
             inline .pointer => |ti| {
                 if (ti.size != .slice) @compileError("pointer field types must be slices");
                 const child_ti = @typeInfo(ti.child);
                 if (child_ti != .bool and child_ti != .int and child_ti != .float) {
                     @compileError("slice child type must be primitive");
-                }
-
-                total_sz += @field(value, f.name).len * @sizeOf(ti.child);
-                if (i < t_fields.len - 1) {
-                    total_sz += @sizeOf(usize);
                 }
             },
             else => |ti| @compileError(
@@ -38,8 +31,27 @@ pub fn serialize(comptime T: type, allocator: std.mem.Allocator, value: *const T
             ),
         }
     }
+}
 
-    std.debug.print("Total sz: {}", .{total_sz});
+/// Serialize a struct to byte buffer.
+/// value is not owned, should be managed by the caller.
+pub fn serialize(comptime T: type, allocator: std.mem.Allocator, value: *const T) ![]u8 {
+    check_type_serializable(T);
+    var total_sz: usize = 0;
+    const t_fields = std.meta.fields(T);
+    inline for (t_fields, 0..) |f, i| {
+        switch (@typeInfo(f.type)) {
+            inline .bool, .int, .float => total_sz += @sizeOf(f.type),
+            inline .pointer => |ti| {
+                total_sz += @field(value, f.name).len * @sizeOf(ti.child);
+                if (i < t_fields.len - 1) {
+                    total_sz += @sizeOf(usize);
+                }
+            },
+            else => {},
+        }
+    }
+
     const buf = try allocator.alloc(u8, total_sz);
     errdefer allocator.free(buf);
 
@@ -71,6 +83,63 @@ pub fn serialize(comptime T: type, allocator: std.mem.Allocator, value: *const T
         }
     }
     return buf;
+}
+
+/// Deserialize a byte buffer to the given type struct.
+/// buffer is not owned, should be managed by the caller.
+pub fn deserialize(comptime T: type, allocator: std.mem.Allocator, buffer: []u8) !*T {
+    check_type_serializable(T);
+    var res = try allocator.create(T);
+    errdefer allocator.destroy(res);
+
+    const t_fields = std.meta.fields(T);
+    var offset: usize = 0;
+    inline for (t_fields, 0..) |f, i| {
+        switch (@typeInfo(f.type)) {
+            inline .pointer => |ti| {
+                const child_sz = @sizeOf(ti.child);
+                const slice_len = if (i < t_fields.len - 1) not_last: {
+                    const len_size = @sizeOf(usize);
+                    if (offset + len_size > buffer.len) return error.BufferTooSmall;
+                    const sl = std.mem.bytesToValue(
+                        usize,
+                        buffer[offset .. offset + len_size],
+                    );
+                    offset += len_size;
+                    break :not_last sl;
+                } else last: {
+                    const rem_sz = buffer.len - offset;
+                    if (rem_sz % child_sz != 0) {
+                        return error.RemainingBufferSizeNotDivisile;
+                    }
+
+                    break :last rem_sz / child_sz;
+                };
+                @field(res, f.name) = try allocator.alloc(ti.child, slice_len);
+                // FIXME: Freeing the slice here is not enough.
+                errdefer allocator.free(@field(res, f.name));
+                for (0..slice_len) |si| {
+                    if (offset + child_sz > buffer.len) return error.BufferTooSmall;
+                    @field(res, f.name)[si] = std.mem.bytesToValue(
+                        ti.child,
+                        buffer[offset .. offset + child_sz],
+                    );
+                    offset += child_sz;
+                }
+            },
+            inline else => {
+                const field_sz = @sizeOf(f.type);
+                if (offset + field_sz > buffer.len) return error.BufferTooSmall;
+                @field(res, f.name) = std.mem.bytesToValue(
+                    f.type,
+                    buffer[offset .. offset + field_sz],
+                );
+                offset += field_sz;
+            },
+        }
+    }
+
+    return res;
 }
 
 const PageMeta = struct {

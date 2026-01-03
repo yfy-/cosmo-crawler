@@ -147,7 +147,7 @@ pub fn Channel(comptime T: type, comptime message_free: bool) type {
                     switch (@typeInfo(t_info.pointer.child)) {
                         .@"struct", .@"enum", .@"union" => {
                             if (@hasDecl(t_info.pointer.child, "deinit")) {
-                                msg.message.deinit();
+                                msg.message.deinit(self.allocator);
                             }
                             self.allocator.destroy(msg.message);
                         },

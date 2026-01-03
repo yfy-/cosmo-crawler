@@ -114,7 +114,7 @@ pub const HTMLStripper = struct {
     }
 
     /// Strip given html. Returned slice is owned by the caller.
-    pub fn strip(self: *Self, html: []const u8) ![]const u8 {
+    pub fn strip(self: *Self, html: []const u8) ![]u8 {
         // Clear stack and links.
         self.clearAndFree();
 

@@ -6,6 +6,8 @@ make it a web crawler.
 
 ## Build
 
+Currently only works with Zig 0.14.
+
 ``` shell
 # An optimized build
 zig build -Doptimize=ReleaseFast

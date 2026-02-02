@@ -98,7 +98,7 @@ pub fn deserialize(
     inline for (t_fields) |f| {
         const ti = @typeInfo(f.type);
         if (ti != .pointer) continue;
-        @field(res, f.name) = &.{};
+        @field(res, f.name).len = 0;
     }
 
     // Deallocate the slice fields on errors.

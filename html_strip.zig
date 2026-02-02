@@ -54,26 +54,28 @@ pub const HTMLStripper = struct {
     });
 
     allocator: Allocator,
-    links: ArrayList([]u8),
+    links: ArrayList([]const u8),
 
-    _stack: ArrayList([]u8),
+    // stores unmanaged tags.
+    _stack: ArrayList([]const u8),
+
     _state: *const fn (
         *Self,
         []const u8,
         *EntityAutoTranslator,
     ) Error!usize = _beg,
-    _tag_buffer: CharList,
-    _attr_key_buffer: CharList,
+    _tag_buffer: []const u8,
+    _attr_key_buffer: []const u8,
     _attr_val_buffer: EntityAutoTranslator,
     _attr_val_quote: ?u8 = null,
 
     pub fn init(allocator: Allocator) Self {
         return Self{
             .allocator = allocator,
-            ._stack = ArrayList([]u8){},
-            .links = ArrayList([]u8){},
-            ._tag_buffer = CharList{},
-            ._attr_key_buffer = CharList{},
+            ._stack = ArrayList([]const u8){},
+            .links = ArrayList([]const u8){},
+            ._tag_buffer = &.{},
+            ._attr_key_buffer = &.{},
             ._attr_val_buffer = EntityAutoTranslator.init(
                 allocator,
                 false,
@@ -82,40 +84,29 @@ pub const HTMLStripper = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        for (self._stack.items) |item| {
-            self.allocator.free(item);
-        }
         self._stack.deinit(self.allocator);
 
         for (self.links.items) |item| {
             self.allocator.free(item);
         }
         self.links.deinit(self.allocator);
-
-        self._tag_buffer.deinit(self.allocator);
-        self._attr_key_buffer.deinit(self.allocator);
         self._attr_val_buffer.deinit();
     }
 
     pub fn clearAndFree(self: *Self) void {
-        for (self._stack.items) |item| {
-            self.allocator.free(item);
-        }
         self._stack.clearAndFree(self.allocator);
 
         for (self.links.items) |item| {
             self.allocator.free(item);
         }
         self.links.clearAndFree(self.allocator);
-        self._tag_buffer.clearAndFree(self.allocator);
-        self._attr_key_buffer.clearAndFree(self.allocator);
         self._attr_val_buffer.clearAndFree();
         self._state = _beg;
     }
 
     /// Strip given html. Returned slice is owned by the caller.
     pub fn strip(self: *Self, html: []const u8) ![]u8 {
-        // Clear stack and links.
+        // Clear stack and links before we start stripping.
         self.clearAndFree();
 
         var stripped = EntityAutoTranslator.init(self.allocator, true);
@@ -126,11 +117,12 @@ pub const HTMLStripper = struct {
                 i += skip;
             } else |err| {
                 std.log.err(
-                    "Error {} at {s} with '{c}' at index '{d}'",
+                    "Error {} at {s}>{c}<{s} at index '{d}'",
                     .{
                         err,
-                        html[@max(0, i -| 100)..@min(i +| 101, html.len - 1)],
+                        html[@max(0, i -| 100)..i],
                         html[i],
+                        html[i + 1 .. @min(i +| 101, html.len - 1)],
                         i,
                     },
                 );
@@ -179,7 +171,7 @@ pub const HTMLStripper = struct {
                 if (html[1] == '/' and
                     std.mem.eql(u8, tag, html[2..tag_end_size]))
                 {
-                    try self._tag_buffer.appendSlice(self.allocator, tag);
+                    self._tag_buffer = tag;
                     self._state = _tagEndFound;
                     return tag_end_size;
                 }
@@ -229,19 +221,24 @@ pub const HTMLStripper = struct {
         const c = html[0];
         // Handle comments below
         if (html.len > 2 and std.mem.eql(u8, html[0..3], "!--")) {
-            self._tag_buffer.clearAndFree(self.allocator);
+            self._tag_buffer.len = 0;
             self._state = _comment;
             return 3;
         }
 
         if (isASCIIWhite(c) or c == '>' or c == '/') {
-            const tag = try self._tag_buffer.toOwnedSlice(self.allocator);
-            try self._stack.append(self.allocator, tag);
+            // const tag = try self._tag_buffer.toOwnedSlice(self.allocator);
+            try self._stack.append(self.allocator, self._tag_buffer);
+            self._tag_buffer.len = 0;
             self._state = _tagStartFound;
             return if (isASCIIWhite(c)) 1 else 0;
         }
 
-        try self._tag_buffer.append(self.allocator, c);
+        if (self._tag_buffer.len == 0) {
+            self._tag_buffer.ptr = html.ptr;
+        }
+
+        self._tag_buffer.len += 1;
         return 1;
     }
 
@@ -287,7 +284,11 @@ pub const HTMLStripper = struct {
             return if (c == '>') 0 else 1;
         }
 
-        try self._tag_buffer.append(self.allocator, c);
+        if (self._tag_buffer.len == 0) {
+            self._tag_buffer.ptr = html.ptr;
+        }
+
+        self._tag_buffer.len += 1;
         return 1;
     }
 
@@ -296,19 +297,13 @@ pub const HTMLStripper = struct {
         while (found_idx > 0) : (found_idx -= 1) {
             if (std.mem.eql(
                 u8,
-                self._tag_buffer.items,
+                self._tag_buffer,
                 self._stack.items[found_idx - 1],
             )) {
-                self.allocator.free(self._stack.orderedRemove(found_idx - 1));
-                std.log.warn(
-                    "Found matching tag at: {}",
-                    .{found_idx - 1},
-                );
+                _ = self._stack.orderedRemove(found_idx - 1);
                 return;
             }
         }
-
-        std.log.warn("Stray tag.", .{});
     }
 
     fn _tagEndFound(
@@ -320,29 +315,19 @@ pub const HTMLStripper = struct {
         const c = html[0];
         if (isASCIIWhite(c)) return 1;
         if (c == '>') {
-            defer self._tag_buffer.clearAndFree(self.allocator);
+            defer self._tag_buffer.len = 0;
             if (self._stack.getLastOrNull()) |tag| {
-                if (self._tag_buffer.items.len > 0 and
-                    !std.mem.eql(u8, tag, self._tag_buffer.items))
-                {
-                    std.log.warn(
-                        "Unmatched tag: '{s}'",
-                        .{self._tag_buffer.items},
-                    );
+                if (self._tag_buffer.len > 0 and !std.mem.eql(u8, tag, self._tag_buffer)) {
                     self.unmatchedTag();
                 } else {
                     _ = self._stack.pop();
-                    self.allocator.free(tag);
                 }
 
                 self._state = _content;
                 return 1;
             }
 
-            std.log.err(
-                "Unmatched tag: '{s}'",
-                .{self._tag_buffer.items},
-            );
+            std.log.err("Unmatched tag: '{s}'", .{self._tag_buffer});
             return error.HTMLUnmatchedTag;
         }
 
@@ -362,24 +347,29 @@ pub const HTMLStripper = struct {
         }
 
         if (c == '>') {
-            self._attr_key_buffer.clearAndFree(self.allocator);
+            self._attr_key_buffer.len = 0;
             self._state = _tagStartFound;
             return 0;
         }
 
-        if (!isASCIIWhite(c)) try self._attr_key_buffer.append(self.allocator, c);
+        if (isASCIIWhite(c)) return 1;
+        if (self._attr_key_buffer.len == 0) {
+            self._attr_key_buffer.ptr = html.ptr;
+        }
+
+        self._attr_key_buffer.len += 1;
         return 1;
     }
 
     fn _helperAttrValEnd(self: *Self) !void {
-        defer self._attr_val_buffer.clearAndFree();
-        defer self._attr_key_buffer.clearAndFree(self.allocator);
+        defer self._attr_val_buffer.clearRetainingCapacity();
+        defer self._attr_key_buffer.len = 0;
 
         if (self._stack.items.len == 0) return error.HTMLAttrWithoutTag;
 
         // Only discover links and clear key and val buffers afterwards.
         if (std.mem.eql(u8, self._stack.getLast(), "a") and
-            std.mem.eql(u8, self._attr_key_buffer.items, "href"))
+            std.mem.eql(u8, self._attr_key_buffer, "href"))
         {
             try self.links.append(self.allocator, try self._attr_val_buffer.toOwnedSlice());
         }

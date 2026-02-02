@@ -145,6 +145,13 @@ pub const AutoTranslator = struct {
         self._in_entity = false;
     }
 
+    /// Clear and but retain buffer sizes.
+    pub fn clearRetainingCapacity(self: *Self) void {
+        self.translated.clearRetainingCapacity();
+        self._entity_buffer.clearRetainingCapacity();
+        self._in_entity = false;
+    }
+
     /// Collect the translated buffer. Slice is owned by the client.
     pub fn toOwnedSlice(self: *Self) Allocator.Error![]u8 {
         defer self.clearAndFree();

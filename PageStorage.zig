@@ -12,15 +12,15 @@ write_opts: *c.rocksdb_writeoptions_t = undefined,
 read_opts: *c.rocksdb_readoptions_t = undefined,
 
 pub const Page = struct {
+    url: [:0]u8,
     last_crawled_sec: i64,
     etag_fp: i64,
     crawl_period_min: i32,
-    url: [:0]u8,
     content: []u8,
 
-    pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
-        allocator.free(self.url);
-        allocator.free(self.content);
+    pub fn deinit(self: @This(), alloc: std.mem.Allocator, content_alloc: std.mem.Allocator) void {
+        alloc.free(self.url);
+        content_alloc.free(self.content);
     }
 };
 
